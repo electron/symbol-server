@@ -32,7 +32,11 @@ proxy.on('proxyReq', function(proxyReq, request, response, options) {
 // to S3 with all-lowercase keys, and we lowercase all requests we receive to
 // match.
 proxy.on('proxyReq', function(proxyReq, request, response, options) {
-  proxyReq.path = PATH_PREFIX + proxyReq.path.toLowerCase();
+  var newPath = proxyReq.path.toLowerCase()
+  // Some symbol servers send + instead of " "
+  // this hacks around that for now
+  newPath = newPath.replace('%2b', '%20')
+  proxyReq.path = PATH_PREFIX + newPath;
 });
 
 http.createServer(function(request, response) {
