@@ -1,13 +1,22 @@
 {
-  "name": "pepto-symbol",
+  "name": "@electron/symbol-server",
   "version": "0.0.1",
+  "private": true,
   "engines": {
-    "node": "6.9.1"
+    "node": "12"
   },
   "dependencies": {
-    "http-proxy": "1.15.2"
+    "http-proxy": "^1.18.1",
+    "uuid": "^8.1.0"
   },
   "scripts": {
-    "start": "node pepto-symbol.js"
+    "build": "tsc",
+    "start": "node lib/index.js"
+  },
+  "devDependencies": {
+    "@types/http-proxy": "^1.17.4",
+    "@types/node": "^14.0.13",
+    "@types/uuid": "^8.0.0",
+    "typescript": "^3.9.5"
   }
 }
