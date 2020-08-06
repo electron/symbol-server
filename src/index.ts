@@ -22,6 +22,17 @@ const proxy = httpProxy.createProxyServer({
 
 const APPS_TO_ALIAS = ['slack'];
 
+// temporary hack to handle apps that rename Electron / Electron Helper --> My App / My App Helper
+// this should be removed once we have a proper solution for upstream crash
+// servers to use.  We delibrately require this apps are prefixed by "/" or " " so
+// that if the app name randomly appears in a SHA is won't break.
+const REPLACEMENTS: [RegExp, string][] = [];
+for (const appName of APPS_TO_ALIAS) {
+  REPLACEMENTS.push([new RegExp(`/${appName}/`, 'g'), '/electron/']);
+  REPLACEMENTS.push([new RegExp(`/${appName} `, 'g'), '/electron ']);
+  REPLACEMENTS.push([new RegExp(`/${appName}%20`, 'g'), '/electron%20']);
+}
+
 proxy.on('proxyReq', (proxyReq, request, response, options) => {
   // symstore.exe and symsrv.dll don't always agree on the case of the path to a
   // given symbol file. Since S3 URLs are case-sensitive, this causes symbol
@@ -34,14 +45,8 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   // this hacks around that for now
   newPath = newPath.replace('%2b', '%20')
 
-  // temporary hack to handle apps that rename Electron / Electron Helper --> My App / My App Helper
-  // this should be removed once we have a proper solution for upstream crash
-  // servers to use.  We delibrately require this apps are prefixed by "/" or " " so
-  // that if the app name randomly appears in a SHA is won't break.
-  for (const appName of APPS_TO_ALIAS) {
-    newPath = newPath.replace(`/${appName}/`, '/electron/');
-    newPath = newPath.replace(`/${appName} `, '/electron ');
-    newPath = newPath.replace(`/${appName}%20`, '/electron%20');
+  for (const replacement of REPLACEMENTS) {
+    newPath = newPath.replace(replacement[0], replacement[1]);
   }
 
   // The symbols may be hosted a deeper path in the S3 bucket
