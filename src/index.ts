@@ -43,7 +43,8 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
 
   // Some symbol servers send + instead of " "
   // this hacks around that for now
-  newPath = newPath.replace('%2b', '%20')
+  newPath = newPath.replace(/%2b/g, '%20');
+  newPath = newPath.replace(/\+/, ' ');
 
   for (const replacement of REPLACEMENTS) {
     newPath = newPath.replace(replacement[0], replacement[1]);
