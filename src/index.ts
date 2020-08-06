@@ -29,8 +29,8 @@ const APPS_TO_ALIAS = ['slack'];
 const REPLACEMENTS: [RegExp, string][] = [];
 for (const appName of APPS_TO_ALIAS) {
   REPLACEMENTS.push([new RegExp(`/${appName}/`, 'g'), '/electron/']);
-  REPLACEMENTS.push([new RegExp(`/${appName} `, 'g'), '/electron ']);
   REPLACEMENTS.push([new RegExp(`/${appName}%20`, 'g'), '/electron%20']);
+  REPLACEMENTS.push([new RegExp(`/${appName}\\.`, 'g'), '/electron.']);
 }
 
 proxy.on('proxyReq', (proxyReq, request, response, options) => {
@@ -44,7 +44,7 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   // Some symbol servers send + instead of " "
   // this hacks around that for now
   newPath = newPath.replace(/%2b/g, '%20');
-  newPath = newPath.replace(/\+/g, ' ');
+  newPath = newPath.replace(/\+/g, '%20');
 
   for (const replacement of REPLACEMENTS) {
     newPath = newPath.replace(replacement[0], replacement[1]);
