@@ -20,6 +20,8 @@ const proxy = httpProxy.createProxyServer({
   changeOrigin: true,
 });
 
+const APPS_TO_ALIAS = ['slack'];
+
 proxy.on('proxyReq', (proxyReq, request, response, options) => {
   // symstore.exe and symsrv.dll don't always agree on the case of the path to a
   // given symbol file. Since S3 URLs are case-sensitive, this causes symbol
@@ -27,6 +29,15 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   // to S3 with all-lowercase keys, and we lowercase all requests we receive to
   // match.
   let newPath = proxyReq.path.toLowerCase()
+
+  // temporary hack to handle apps that rename Electron / Electron Helper --> My App / My App Helper
+  // this should be removed once we have a proper solution for upstream crash
+  // servers to use.  We delibrately require this apps are prefixed by "/" or " " so
+  // that if the app name randomly appears in a SHA is won't break.
+  for (const appName of APPS_TO_ALIAS) {
+    newPath = newPath.replace(`/${appName}/`, '/electron/');
+    newPath = newPath.replace(`/${appName} `, '/electron ');
+  }
 
   // Some symbol servers send + instead of " "
   // this hacks around that for now
@@ -65,3 +76,8 @@ proxy.on('error', (err, req, res) => {
 http.createServer((req, res) => {
   proxy.web(req, res, { target: TARGET_URL });
 }).listen(process.env.PORT || 8080);
+
+process.on('uncaughtException', (err) => {
+  // Avoid process dieing on uncaughtException
+  console.error(err);
+});
