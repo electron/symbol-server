@@ -30,6 +30,10 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   // match.
   let newPath = proxyReq.path.toLowerCase()
 
+  // Some symbol servers send + instead of " "
+  // this hacks around that for now
+  newPath = newPath.replace('%2b', '%20')
+
   // temporary hack to handle apps that rename Electron / Electron Helper --> My App / My App Helper
   // this should be removed once we have a proper solution for upstream crash
   // servers to use.  We delibrately require this apps are prefixed by "/" or " " so
@@ -37,11 +41,8 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   for (const appName of APPS_TO_ALIAS) {
     newPath = newPath.replace(`/${appName}/`, '/electron/');
     newPath = newPath.replace(`/${appName} `, '/electron ');
+    newPath = newPath.replace(`/${appName}%20`, '/electron%20');
   }
-
-  // Some symbol servers send + instead of " "
-  // this hacks around that for now
-  newPath = newPath.replace('%2b', '%20')
 
   // The symbols may be hosted a deeper path in the S3 bucket
   // so we prefix the incoming path with that prefix
