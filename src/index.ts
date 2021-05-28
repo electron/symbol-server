@@ -1,6 +1,7 @@
 import assert from 'assert';
 import * as http from 'http';
 import httpProxy from 'http-proxy';
+import LRU from 'lru-cache';
 import * as url from 'url';
 import * as uuid from 'uuid';
 
@@ -33,13 +34,17 @@ for (const appName of APPS_TO_ALIAS) {
   REPLACEMENTS.push([new RegExp(`/${appName}\\.`, 'g'), '/electron.']);
 }
 
-proxy.on('proxyReq', (proxyReq, request, response, options) => {
+const missingSymbolCache = new LRU<string, boolean>({
+  max: 10000,
+});
+
+function incomingPathToProxyPath(path: string): string {
   // symstore.exe and symsrv.dll don't always agree on the case of the path to a
   // given symbol file. Since S3 URLs are case-sensitive, this causes symbol
   // loads to fail. To get around this, we assume that the symbols were uploaded
   // to S3 with all-lowercase keys, and we lowercase all requests we receive to
   // match.
-  let newPath = proxyReq.path.toLowerCase()
+  let newPath = path.toLowerCase();
 
   // Some symbol servers send + instead of " "
   // this hacks around that for now
@@ -52,7 +57,11 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
 
   // The symbols may be hosted a deeper path in the S3 bucket
   // so we prefix the incoming path with that prefix
-  proxyReq.path = `${PATH_PREFIX || ''}${newPath}`;
+  return `${PATH_PREFIX || ''}${newPath}`;
+}
+
+proxy.on('proxyReq', (proxyReq, request, response, options) => {
+  proxyReq.path = incomingPathToProxyPath(proxyReq.path);
 
   // S3 determines the bucket from the Host header
   proxyReq.setHeader('Host', TARGET_HOST);
@@ -65,8 +74,12 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   // convert 403s to 404s so symsrv.dll doesn't freak out.
   const originalWriteHead = response.writeHead;
   response.writeHead = (...args: [number, any]) => {
-    if (args[0] == 403)
+    if (args[0] == 403) {
+      missingSymbolCache.set(proxyReq.path, true);
       args[0] = 404;
+    } else {
+      missingSymbolCache.set(proxyReq.path, false);
+    }
     return originalWriteHead.apply(response, args);
   };
 });
@@ -84,6 +97,11 @@ proxy.on('error', (err, req, res) => {
 });
 
 http.createServer((req, res) => {
+  const parsed = new url.URL(`http://localhost${req.url!}`);
+  const cacheKey = incomingPathToProxyPath(parsed.pathname + parsed.search);
+  if (missingSymbolCache.get(cacheKey)) {
+    return res.writeHead(404).end();
+  }
   proxy.web(req, res, { target: TARGET_URL });
 }).listen(process.env.PORT || 8080);
 
