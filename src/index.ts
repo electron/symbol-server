@@ -56,6 +56,9 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
 
   // S3 determines the bucket from the Host header
   proxyReq.setHeader('Host', TARGET_HOST);
+  
+  response.setHeader('Access-Control-Allow-Origin', '*');
+  response.setHeader('Access-Control-Allow-Methods', 'GET');
 
   // S3 returns 403 errors for files that don't exist. But when symsrv.dll sees a
   // 403 it blacklists the server for the rest of the debugging session. So we
