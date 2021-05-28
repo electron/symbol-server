@@ -11,7 +11,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "start": "node lib/index.js"
+    "start": "node lib/index.js",
+    "start:dev": "PATH_PREFIX=/atom-shell/symbols S3_BUCKET=gh-contractor-zcbenz npm start"
   },
   "devDependencies": {
     "@types/http-proxy": "^1.17.4",
