@@ -98,6 +98,10 @@ proxy.on('error', (err, req, res) => {
 
 http.createServer((req, res) => {
   const parsed = new url.URL(`http://localhost${req.url!}`);
+  if (parsed.pathname === '/health') {
+    return res.writeHead(200).end('Alive');
+  }
+
   const cacheKey = incomingPathToProxyPath(parsed.pathname + parsed.search);
   const userAgent = req.headers['user-agent'];
   const isSentryRequest = userAgent && userAgent.startsWith('symbolicator/');
