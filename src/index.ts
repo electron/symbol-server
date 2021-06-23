@@ -99,9 +99,23 @@ proxy.on('error', (err, req, res) => {
 http.createServer((req, res) => {
   const parsed = new url.URL(`http://localhost${req.url!}`);
   const cacheKey = incomingPathToProxyPath(parsed.pathname + parsed.search);
+  const userAgent = req.headers['user-agent'];
+  const isSentryRequest = userAgent && userAgent.startsWith('symbolicator/');
+
+  if (isSentryRequest || req.headers['x-electron-symbol-redirect'] === '1') {
+    res.setHeader('Location', url.format({
+      protocol: 'https:',
+      slashes: true,
+      host: TARGET_HOST,
+      pathname: cacheKey,
+    }));
+    return res.writeHead(302).end();
+  }
+
   if (missingSymbolCache.get(cacheKey)) {
     return res.writeHead(404).end();
   }
+
   proxy.web(req, res, { target: TARGET_URL });
 }).listen(process.env.PORT || 8080);
 
