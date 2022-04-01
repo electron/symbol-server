@@ -5,11 +5,9 @@ import LRU from 'lru-cache';
 import * as url from 'url';
 import * as uuid from 'uuid';
 
-const { PATH_PREFIX, S3_BUCKET } = process.env;
+const { PATH_PREFIX, TARGET_HOST } = process.env;
 
-assert(S3_BUCKET, 'S3_BUCKET is defined');
-
-const TARGET_HOST = `${S3_BUCKET}.s3.amazonaws.com`;
+assert(TARGET_HOST, 'TARGET_HOST is defined');
 
 const TARGET_URL = url.format({
   protocol: 'https:',
@@ -40,9 +38,9 @@ const missingSymbolCache = new LRU<string, boolean>({
 
 function incomingPathToProxyPath(path: string): string {
   // symstore.exe and symsrv.dll don't always agree on the case of the path to a
-  // given symbol file. Since S3 URLs are case-sensitive, this causes symbol
+  // given symbol file. Since our artifact URLs are case-sensitive, this causes symbol
   // loads to fail. To get around this, we assume that the symbols were uploaded
-  // to S3 with all-lowercase keys, and we lowercase all requests we receive to
+  // to the artifact store with all-lowercase keys, and we lowercase all requests we receive to
   // match.
   let newPath = path.toLowerCase();
 
@@ -55,7 +53,7 @@ function incomingPathToProxyPath(path: string): string {
     newPath = newPath.replace(replacement[0], replacement[1]);
   }
 
-  // The symbols may be hosted a deeper path in the S3 bucket
+  // The symbols may be hosted a deeper path in the artifact store
   // so we prefix the incoming path with that prefix
   return `${PATH_PREFIX || ''}${newPath}`;
 }
@@ -63,13 +61,13 @@ function incomingPathToProxyPath(path: string): string {
 proxy.on('proxyReq', (proxyReq, request, response, options) => {
   proxyReq.path = incomingPathToProxyPath(proxyReq.path);
 
-  // S3 determines the bucket from the Host header
+  // AZ CDN determines the bucket from the Host header
   proxyReq.setHeader('Host', TARGET_HOST);
   
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'GET');
 
-  // S3 returns 403 errors for files that don't exist. But when symsrv.dll sees a
+  // AZ CDN returns 403 errors for containers that don't exist. But when symsrv.dll sees a
   // 403 it blacklists the server for the rest of the debugging session. So we
   // convert 403s to 404s so symsrv.dll doesn't freak out.
   const originalWriteHead = response.writeHead;
