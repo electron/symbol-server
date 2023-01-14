@@ -32,6 +32,9 @@ for (const appName of APPS_TO_ALIAS) {
   REPLACEMENTS.push([new RegExp(`/${appName}\\.`, 'g'), '/electron.']);
 }
 
+REPLACEMENTS.push([/\/C:\\projects\\src\\out\\Default\\/g, '/']);
+REPLACEMENTS.push([/\/C%3A%5Cprojects%5Csrc%5Cout%5CDefault%5C/g, '/']);
+
 const missingSymbolCache = new LRU<string, boolean>({
   max: 10000,
 });
