@@ -19,7 +19,7 @@ const proxy = httpProxy.createProxyServer({
   changeOrigin: true,
 });
 
-const APPS_TO_ALIAS = ['slack'];
+const APPS_TO_ALIAS = ['slack', 'notion', 'notion dev'];
 
 // temporary hack to handle apps that rename Electron / Electron Helper --> My App / My App Helper
 // this should be removed once we have a proper solution for upstream crash
