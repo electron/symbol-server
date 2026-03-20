@@ -58,7 +58,23 @@ function incomingPathToProxyPath(path: string): string {
 
   // The symbols may be hosted a deeper path in the artifact store
   // so we prefix the incoming path with that prefix
-  return `${PATH_PREFIX || ''}${newPath}`;
+  if (!PATH_PREFIX) {
+    return newPath;
+  }
+
+  // Handle cases where PATH_PREFIX or newPath may or may not have a
+  // leading/trailing slash to avoid double slashes or missing slashes
+  if (PATH_PREFIX.endsWith('/') && newPath.startsWith('/')) {
+    return `${PATH_PREFIX.slice(0, -1)}${newPath}`;
+  }
+
+  // Handle cases where PATH_PREFIX may or may not have a trailing slash
+  // and newPath may or may not have a leading slash
+  if (!PATH_PREFIX.endsWith('/') && !newPath.startsWith('/')) {
+    return `${PATH_PREFIX}/${newPath}`;
+  }
+
+  return `${PATH_PREFIX}${newPath}`;
 }
 
 proxy.on('proxyReq', (proxyReq, request, response, options) => {
