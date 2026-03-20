@@ -1,4 +1,5 @@
 import assert from 'assert';
+import aws4 from 'aws4';
 import * as http from 'http';
 import httpProxy from 'http-proxy';
 import LRU from 'lru-cache';
@@ -39,6 +40,20 @@ const missingSymbolCache = new LRU<string, boolean>({
   max: 10000,
 });
 
+const signingAccessKeyId = process.env.AWS_ACCESS_KEY_ID;
+const signingSecretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+const signingSessionToken = process.env.AWS_SESSION_TOKEN;
+const signingRegion = process.env.AWS_REGION;
+const shouldSignS3Requests = Boolean(signingAccessKeyId && signingSecretAccessKey);
+
+assert(!shouldSignS3Requests || signingRegion, 'AWS_REGION is defined when S3 request signing is enabled');
+
+type ProxyRequest = http.IncomingMessage & {
+  proxyPath?: string;
+  cacheKey?: string;
+  proxyMethod?: string;
+};
+
 function incomingPathToProxyPath(path: string): string {
   // symstore.exe and symsrv.dll don't always agree on the case of the path to a
   // given symbol file. Since our artifact URLs are case-sensitive, this causes symbol
@@ -77,8 +92,35 @@ function incomingPathToProxyPath(path: string): string {
   return `${PATH_PREFIX}${newPath}`;
 }
 
+function signS3ProxyPath(path: string, method: string): string {
+  if (!shouldSignS3Requests) {
+    return path;
+  }
+
+  const targetUrl = new url.URL(path, TARGET_URL);
+  const signedRequest = aws4.sign({
+    host: TARGET_HOST!,
+    method,
+    service: 's3',
+    region: signingRegion!,
+    signQuery: true,
+    path: `${targetUrl.pathname}${targetUrl.search}`,
+  }, {
+    accessKeyId: signingAccessKeyId!,
+    secretAccessKey: signingSecretAccessKey!,
+    sessionToken: signingSessionToken,
+  });
+
+  return signedRequest.path || `${targetUrl.pathname}${targetUrl.search}`;
+}
+
 proxy.on('proxyReq', (proxyReq, request, response, options) => {
-  proxyReq.path = incomingPathToProxyPath(proxyReq.path);
+  const req = request as ProxyRequest;
+  const proxyPath = req.proxyPath ?? incomingPathToProxyPath(proxyReq.path);
+  const cacheKey = req.cacheKey ?? incomingPathToProxyPath(proxyReq.path);
+  const proxyMethod = req.proxyMethod ?? proxyReq.method;
+
+  proxyReq.path = proxyPath;
 
   // AZ CDN determines the bucket from the Host header
   proxyReq.setHeader('Host', TARGET_HOST);
@@ -91,12 +133,17 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   // convert 403s to 404s so symsrv.dll doesn't freak out.
   const originalWriteHead = response.writeHead;
   response.writeHead = (...args: [number, any]) => {
-    if (args[0] == 403) {
-      missingSymbolCache.set(proxyReq.path, true);
+    if (proxyMethod === 'GET') {
+      if (args[0] == 403) {
+        missingSymbolCache.set(cacheKey, true);
+        args[0] = 404;
+      } else {
+        missingSymbolCache.set(cacheKey, false);
+      }
+    } else if (args[0] == 403) {
       args[0] = 404;
-    } else {
-      missingSymbolCache.set(proxyReq.path, false);
     }
+
     return originalWriteHead.apply(response, args);
   };
 });
@@ -120,22 +167,32 @@ http.createServer((req, res) => {
   }
 
   const cacheKey = incomingPathToProxyPath(parsed.pathname + parsed.search);
+  const requestMethod = (req.method || 'GET').toUpperCase();
   const userAgent = req.headers['user-agent'];
   const isSentryRequest = userAgent && userAgent.startsWith('symbolicator/');
 
+  let signedProxyPath: string;
+  try {
+    signedProxyPath = signS3ProxyPath(cacheKey, requestMethod);
+  } catch (error) {
+    const errorId = uuid.v4();
+    console.error('Signing Error:', errorId, 'Request:', req.url, error);
+    return res.writeHead(500).end(`Failed to sign S3 request. If this happens consistently please report to https://github.com/electron/symbol-server with this error ID: "${errorId}"`);
+  }
+
   if (isSentryRequest || req.headers['x-electron-symbol-redirect'] === '1') {
-    res.setHeader('Location', url.format({
-      protocol: 'https:',
-      slashes: true,
-      host: TARGET_HOST,
-      pathname: cacheKey,
-    }));
+    res.setHeader('Location', `${TARGET_URL}${signedProxyPath}`);
     return res.writeHead(302).end();
   }
 
   if (missingSymbolCache.get(cacheKey)) {
     return res.writeHead(404).end();
   }
+
+  const proxyReq = req as ProxyRequest;
+  proxyReq.cacheKey = cacheKey;
+  proxyReq.proxyPath = signedProxyPath;
+  proxyReq.proxyMethod = requestMethod;
 
   proxy.web(req, res, { target: TARGET_URL });
 }).listen(process.env.PORT || 8080);
