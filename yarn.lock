@@ -12,7 +12,6 @@ __metadata:
     "@types/http-proxy": "npm:^1.17.6"
     "@types/lru-cache": "npm:^5.1.0"
     "@types/node": "npm:^15.6.1"
-    "@types/uuid": "npm:^8.3.0"
     http-proxy: "npm:^1.18.1"
     lru-cache: "npm:^6.0.0"
     typescript: "npm:^4.3.2"
@@ -47,13 +46,6 @@ __metadata:
   version: 15.6.1
   resolution: "@types/node@npm:15.6.1"
   checksum: 10c0/e3de56c8490d607f9adcdfd30dc52c8f97109fd80828b0dfbaa94a731ba67e790ce2b7f228098ac9e0bd735039c2eec1f412fa8d7ff90ae8a55c708223885eec
-  languageName: node
-  linkType: hard
-
-"@types/uuid@npm:^8.3.0":
-  version: 8.3.0
-  resolution: "@types/uuid@npm:8.3.0"
-  checksum: 10c0/b39ede3212609c3460b14446629796ab6acb61227a249e89d4d188fed84acfe71569b7d01b30a39f4443703810bf2b0959e586e0334d7088f11ec8606d373cde
   languageName: node
   linkType: hard
 
