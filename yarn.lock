@@ -12,11 +12,9 @@ __metadata:
     "@types/http-proxy": "npm:^1.17.6"
     "@types/lru-cache": "npm:^5.1.0"
     "@types/node": "npm:^15.6.1"
-    "@types/uuid": "npm:^8.3.0"
     http-proxy: "npm:^1.18.1"
     lru-cache: "npm:^6.0.0"
     typescript: "npm:^4.3.2"
-    uuid: "npm:^8.3.2"
   languageName: unknown
   linkType: soft
 
@@ -47,13 +45,6 @@ __metadata:
   version: 15.6.1
   resolution: "@types/node@npm:15.6.1"
   checksum: 10c0/e3de56c8490d607f9adcdfd30dc52c8f97109fd80828b0dfbaa94a731ba67e790ce2b7f228098ac9e0bd735039c2eec1f412fa8d7ff90ae8a55c708223885eec
-  languageName: node
-  linkType: hard
-
-"@types/uuid@npm:^8.3.0":
-  version: 8.3.0
-  resolution: "@types/uuid@npm:8.3.0"
-  checksum: 10c0/b39ede3212609c3460b14446629796ab6acb61227a249e89d4d188fed84acfe71569b7d01b30a39f4443703810bf2b0959e586e0334d7088f11ec8606d373cde
   languageName: node
   linkType: hard
 
@@ -118,15 +109,6 @@ __metadata:
     tsc: bin/tsc
     tsserver: bin/tsserver
   checksum: 10c0/1d040c5d4dde256588b3f56a34bac4f62bd64bbfea8e45f138e4c9cfca554b12e79710526d30394281a35d3c66650290307c16b7c1a5a1ef349cdee5bcb922fd
-  languageName: node
-  linkType: hard
-
-"uuid@npm:^8.3.2":
-  version: 8.3.2
-  resolution: "uuid@npm:8.3.2"
-  bin:
-    uuid: dist/bin/uuid
-  checksum: 10c0/bcbb807a917d374a49f475fae2e87fdca7da5e5530820ef53f65ba1d12131bd81a92ecf259cc7ce317cbe0f289e7d79fdfebcef9bfa3087c8c8a2fa304c9be54
   languageName: node
   linkType: hard
 
