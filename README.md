@@ -54,6 +54,14 @@ heroku config:add PATH_PREFIX=/awesome/symbols
 
 Now the symbol server URL can be `http://pepto-symbol.gadgetron.com`.
 
+### Optional S3 request signing
+
+When running against a private S3 origin, the server can sign outgoing `GET` requests.
+
+- Signing is enabled automatically when both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are present.
+- `AWS_REGION` is required when signing is enabled.
+- `AWS_SESSION_TOKEN` is optional, you can use it for [temporary credentials](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp_use-resources.html).
+
 ### Running locally
 
 To run Pepto Symbol locally on port 5000:
