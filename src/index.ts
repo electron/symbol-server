@@ -1,9 +1,9 @@
 import assert from 'assert';
+import * as crypto from 'crypto';
 import * as http from 'http';
 import httpProxy from 'http-proxy';
 import LRU from 'lru-cache';
 import * as url from 'url';
-import * as uuid from 'uuid';
 
 const { PATH_PREFIX, TARGET_HOST } = process.env;
 
@@ -86,7 +86,7 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
 });
 
 proxy.on('error', (err, req, res) => {
-  const errorId = uuid.v4();
+  const errorId = crypto.randomUUID();
 
   console.error('Error:', errorId, 'Request:', req.url, err);
 
