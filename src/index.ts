@@ -5,9 +5,24 @@ import httpProxy from 'http-proxy';
 import LRU from 'lru-cache';
 import * as url from 'url';
 
-const { PATH_PREFIX, TARGET_HOST } = process.env;
+const { PATH_PREFIX, TARGET_HOST, MAX_UPSTREAM_CONCURRENCY } = process.env;
 
 assert(TARGET_HOST, 'TARGET_HOST is defined');
+
+// How long a "this symbol does not exist" answer stays valid, both in our
+// in-memory cache and in any CDN/client honoring Cache-Control. Kept short-ish
+// so symbols uploaded later (e.g. new releases) aren't hidden forever.
+const MISSING_SYMBOL_TTL_SECONDS = 60 * 60;
+const MISSING_CACHE_CONTROL = `public, max-age=${MISSING_SYMBOL_TTL_SECONDS}`;
+// Symbol files are immutable for a given debug-id path, so hits can be cached
+// aggressively by CDNs/clients.
+const HIT_CACHE_CONTROL = 'public, max-age=604800, immutable';
+
+// Cap on concurrent proxied upstream requests. Beyond this we shed load
+// immediately with a 503 instead of queueing, so the dyno's backlog stays
+// shallow during floods.
+const UPSTREAM_CONCURRENCY_LIMIT = parseInt(MAX_UPSTREAM_CONCURRENCY || '', 10) || 100;
+const RETRY_AFTER_SECONDS = 30;
 
 const TARGET_URL = url.format({
   protocol: 'https:',
@@ -36,8 +51,14 @@ REPLACEMENTS.push([/\/c:\\projects\\src\\out\\default\\/g, '/']);
 REPLACEMENTS.push([/\/c%3a%5cprojects%5csrc%5cout%5cdefault%5c/g, '/']);
 
 const missingSymbolCache = new LRU<string, boolean>({
-  max: 10000,
+  max: 500_000,
+  maxAge: MISSING_SYMBOL_TTL_SECONDS * 1000,
 });
+
+// Proxied requests currently awaiting an upstream response, keyed by rewritten
+// path. Used to dedupe identical concurrent lookups and to enforce the
+// upstream concurrency cap.
+const inFlightRequests = new Map<string, Promise<void>>();
 
 function incomingPathToProxyPath(path: string): string {
   // symstore.exe and symsrv.dll don't always agree on the case of the path to a
@@ -78,8 +99,12 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
     if (args[0] == 403) {
       missingSymbolCache.set(proxyReq.path, true);
       args[0] = 404;
+      response.setHeader('Cache-Control', MISSING_CACHE_CONTROL);
     } else {
       missingSymbolCache.set(proxyReq.path, false);
+      if (args[0] == 200 && !response.getHeader('cache-control')) {
+        response.setHeader('Cache-Control', HIT_CACHE_CONTROL);
+      }
     }
     return originalWriteHead.apply(response, args);
   };
@@ -114,15 +139,48 @@ http.createServer((req, res) => {
       host: TARGET_HOST,
       pathname: cacheKey,
     }));
+    res.setHeader('Cache-Control', 'no-store');
     return res.writeHead(302).end();
   }
 
   if (missingSymbolCache.get(cacheKey)) {
-    return res.writeHead(404).end();
+    return res.writeHead(404, { 'Cache-Control': MISSING_CACHE_CONTROL }).end();
   }
 
-  proxy.web(req, res, { target: TARGET_URL });
+  // If an identical lookup is already being proxied, wait for it to settle
+  // rather than launching a duplicate upstream fetch. If it negative-cached
+  // the path we can answer 404 for free, otherwise proxy as usual.
+  const inFlight = inFlightRequests.get(cacheKey);
+  if (inFlight) {
+    inFlight.then(() => {
+      if (missingSymbolCache.get(cacheKey)) {
+        return res.writeHead(404, { 'Cache-Control': MISSING_CACHE_CONTROL }).end();
+      }
+      proxyToUpstream(req, res, cacheKey);
+    });
+    return;
+  }
+
+  proxyToUpstream(req, res, cacheKey);
 }).listen(process.env.PORT || 8080);
+
+function proxyToUpstream(req: http.IncomingMessage, res: http.ServerResponse, cacheKey: string) {
+  if (inFlightRequests.size >= UPSTREAM_CONCURRENCY_LIMIT) {
+    // Shed load immediately instead of queueing behind a saturated upstream,
+    // otherwise the router backlog fills up and everyone gets H11 503s.
+    res.setHeader('Retry-After', String(RETRY_AFTER_SECONDS));
+    return res.writeHead(503).end('Too many concurrent symbol requests, retry later');
+  }
+
+  inFlightRequests.set(cacheKey, new Promise((resolve) => {
+    res.on('close', () => {
+      inFlightRequests.delete(cacheKey);
+      resolve();
+    });
+  }));
+
+  proxy.web(req, res, { target: TARGET_URL });
+}
 
 process.on('uncaughtException', (err) => {
   // Avoid process dieing on uncaughtException

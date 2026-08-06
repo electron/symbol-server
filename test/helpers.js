@@ -77,11 +77,12 @@ function startUpstream(handler) {
   });
 }
 
-async function startSymbolServer({ targetHost, pathPrefix } = {}) {
+async function startSymbolServer({ targetHost, pathPrefix, env: extraEnv } = {}) {
   const port = await getFreePort();
 
   const env = {
     ...process.env,
+    ...extraEnv,
     TARGET_HOST: targetHost,
     PORT: String(port),
     // http-proxy uses the default https agent; NODE_EXTRA_CA_CERTS is the
@@ -134,14 +135,14 @@ async function startSymbolServer({ targetHost, pathPrefix } = {}) {
 
 // Spawn an upstream + symbol-server pair and register cleanup with the test
 // context. Returns { server, upstream }.
-async function startProxy(t, { handler, pathPrefix } = {}) {
+async function startProxy(t, { handler, pathPrefix, env } = {}) {
   const upstream = await startUpstream(handler || ((req, res) => {
     res.writeHead(200);
     res.end('ok');
   }));
   t.after(() => upstream.close());
 
-  const server = await startSymbolServer({ targetHost: upstream.host, pathPrefix });
+  const server = await startSymbolServer({ targetHost: upstream.host, pathPrefix, env });
   t.after(() => server.stop());
 
   return { server, upstream };
