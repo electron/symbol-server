@@ -80,6 +80,31 @@ const inFlightRequests = new Map<string, Promise<void>>();
 // what the concurrency cap is enforced against.
 let activeUpstreamRequests = 0;
 
+// Ties each proxied downstream request to the upstream request http-proxy
+// opens for it. The shared 'proxyReq' hook below fires for every proxied
+// request, so it must map each proxyReq back to the right downstream request;
+// keying by the incoming request object does that without any cleanup
+// bookkeeping (entries die with the request).
+interface UpstreamLifecycle {
+  proxyReq: http.ClientRequest | null;
+  downstreamGone: boolean;
+  settle: () => void;
+}
+
+const upstreamLifecycles = new WeakMap<http.IncomingMessage, UpstreamLifecycle>();
+
+// Cancel the outgoing upstream request. destroy() on a request that already
+// completed just tears down its (connection: close) socket, but be defensive:
+// a throw here would bubble into an event handler and kill nothing gracefully.
+function abortUpstreamRequest(proxyReq: http.ClientRequest) {
+  if (proxyReq.destroyed) return;
+  try {
+    proxyReq.destroy();
+  } catch (err) {
+    console.error('Failed to abort upstream request:', err);
+  }
+}
+
 function incomingPathToProxyPath(path: string): string {
   // symstore.exe and symsrv.dll don't always agree on the case of the path to a
   // given symbol file. Since our artifact URLs are case-sensitive, this causes symbol
@@ -128,12 +153,31 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
     }
     return originalWriteHead.apply(response, args);
   };
+
+  const lifecycle = upstreamLifecycles.get(request);
+  if (lifecycle) {
+    lifecycle.proxyReq = proxyReq;
+    // The upstream slot and dedup promise settle on the UPSTREAM request's
+    // lifecycle, not the downstream response's: 'close' fires both when the
+    // proxied response has been fully read and when the request is destroyed
+    // or errors, so normal completion and client-abort cancellation route to
+    // the same idempotent settle.
+    proxyReq.on('close', lifecycle.settle);
+    // The client may have vanished between proxy.web() and the socket
+    // assignment that fires this event; cancel the upstream work right away.
+    if (lifecycle.downstreamGone) abortUpstreamRequest(proxyReq);
+  }
 });
 
 proxy.on('error', (err, req, res) => {
   const errorId = crypto.randomUUID();
 
   console.error('Error:', errorId, 'Request:', req.url, err);
+
+  // A deliberately canceled upstream request (client disconnected mid-proxy)
+  // can surface its teardown error here; there is no one left to answer and
+  // writing headers to a closed/finished response would throw.
+  if (res.destroyed || res.writableEnded || res.headersSent) return;
 
   res.writeHead(500, {
     'Content-Type': 'text/plain'
@@ -220,10 +264,10 @@ function proxyToUpstream(req: http.IncomingMessage, res: http.ServerResponse, ca
   }
 
   activeUpstreamRequests++;
-  // Both 'close' and 'error' can fire for the same response, and settle() is
-  // additionally called by hand below when the client disconnected before the
-  // listeners were registered; settle exactly once so the active count can
-  // never be decremented twice.
+  // settle() can be reached from several events (the upstream request's
+  // 'close', the downstream 'close'/'error' fallback below, and by hand when
+  // the client disconnected before the listeners were registered); settle
+  // exactly once so the active count can never be decremented twice.
   let settled = false;
   let settle!: () => void;
   const inFlight = new Promise<void>((resolve) => {
@@ -240,9 +284,40 @@ function proxyToUpstream(req: http.IncomingMessage, res: http.ServerResponse, ca
       }
       resolve();
     };
-    res.on('close', settle);
-    res.on('error', settle);
   });
+
+  // Tie teardown to the actual upstream request rather than the downstream
+  // response alone: http-proxy does not cancel the outgoing request by itself
+  // when the client disconnects mid-proxy (its req 'aborted' hook never fires
+  // on modern Node for requests whose body was already fully received, i.e.
+  // every GET), so settling on downstream 'close' freed the slot and woke
+  // dedup waiters while the upstream fetch was still running — bypassing the
+  // cap. Instead, downstream 'close'/'error' destroys the upstream request,
+  // and the slot/dedup promise settle only once that request has ended or
+  // been aborted (its 'close' listener, registered in the proxyReq hook), so
+  // waiters can never wake into a still-occupied slot.
+  const lifecycle: UpstreamLifecycle = { proxyReq: null, downstreamGone: false, settle };
+  upstreamLifecycles.set(req, lifecycle);
+  const onDownstreamGone = () => {
+    if (lifecycle.downstreamGone) return;
+    lifecycle.downstreamGone = true;
+    if (lifecycle.proxyReq) {
+      // Cancel the upstream work; settle fires when the destroyed request
+      // emits 'close'. (After a normal completion this destroy is a no-op on
+      // an already-finished request.)
+      abortUpstreamRequest(lifecycle.proxyReq);
+    } else {
+      // No upstream request was captured for this response — either we never
+      // reached proxy.web below, or http-proxy skipped the proxyReq event
+      // (it does for Expect: 100-continue requests). Nothing to cancel;
+      // settle now so the slot cannot leak. Should the capture still happen a
+      // tick later, the downstreamGone flag above makes it destroy the
+      // upstream request immediately.
+      settle();
+    }
+  };
+  res.on('close', onDownstreamGone);
+  res.on('error', onDownstreamGone);
 
   if (!inFlightRequests.has(cacheKey)) {
     inFlightRequests.set(cacheKey, inFlight);

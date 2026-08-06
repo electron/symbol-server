@@ -366,6 +366,65 @@ test('a dedup waiter whose client disconnects mid-wait does not leak an upstream
   assert.equal(upstream.requests.length, 2, 'only the leader and the probe should reach upstream');
 });
 
+test('client disconnect mid-proxy aborts upstream and frees the slot only after', async (t) => {
+  // Regression test: the slot counter and dedup promise used to settle when
+  // the DOWNSTREAM response closed, but http-proxy does not cancel the
+  // UPSTREAM request on its own (its req 'aborted' hook never fires for
+  // fully-received requests on modern Node). A client disconnecting mid-proxy
+  // therefore freed its slot while the upstream fetch kept running: with a
+  // cap of 1, a distinct second request then also reached upstream, which saw
+  // 2 simultaneous active requests and never observed an abort.
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  let active = 0;
+  let maxActive = 0;
+  let aborts = 0;
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const { server, upstream } = await startProxy(t, {
+    env: { MAX_UPSTREAM_CONCURRENCY: '1' },
+    handler: async (req, res) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      res.on('close', () => {
+        if (!res.writableEnded) aborts += 1;
+        active -= 1;
+      });
+      await held;
+      if (!res.destroyed) {
+        res.writeHead(200);
+        res.end('ok');
+      }
+    },
+  });
+
+  // First request reaches the held upstream, then its client disconnects.
+  const first = http.request({
+    host: '127.0.0.1', port: server.port, path: '/held/foo.pdb/abc/foo.pdb', method: 'GET',
+  });
+  first.on('error', () => {});
+  first.end();
+  while (upstream.requests.length === 0) await sleep(10);
+  first.destroy();
+
+  // The upstream request must actually be canceled, not left running.
+  const abortDeadline = Date.now() + 2000;
+  while (aborts === 0 && Date.now() < abortDeadline) await sleep(10);
+  assert.equal(aborts, 1, 'upstream must observe the abort after the client disconnects');
+  assert.equal(active, 0, 'upstream must have no active request left');
+  await sleep(50); // let the freed slot settle server-side
+
+  // A distinct second request may now use the freed slot — but must never
+  // have overlapped with the first at upstream.
+  const second = request(server.port, '/other/bar.pdb/def/bar.pdb');
+  const reachDeadline = Date.now() + 2000;
+  while (upstream.requests.length < 2 && Date.now() < reachDeadline) await sleep(10);
+  assert.equal(upstream.requests.length, 2, 'second request should reach upstream after the abort');
+  release();
+  const res2 = await second;
+  assert.equal(res2.statusCode, 200);
+  assert.ok(maxActive <= 1, `upstream must never see 2 simultaneous active requests, saw ${maxActive}`);
+});
+
 test('concurrent requests for the same missing path only hit upstream once', async (t) => {
   const { server, upstream } = await startProxy(t, {
     handler: (req, res) => {
