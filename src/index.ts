@@ -9,6 +9,15 @@ const { PATH_PREFIX, TARGET_HOST } = process.env;
 
 assert(TARGET_HOST, 'TARGET_HOST is defined');
 
+// How long a "this symbol does not exist" answer stays valid, both in our
+// in-memory cache and in any CDN/client honoring Cache-Control. Kept short-ish
+// so symbols uploaded later (e.g. new releases) aren't hidden forever.
+const MISSING_SYMBOL_TTL_SECONDS = 60 * 60;
+const MISSING_CACHE_CONTROL = `public, max-age=${MISSING_SYMBOL_TTL_SECONDS}`;
+// Symbol files are immutable for a given debug-id path, so hits can be cached
+// aggressively by CDNs/clients.
+const HIT_CACHE_CONTROL = 'public, max-age=604800, immutable';
+
 const TARGET_URL = url.format({
   protocol: 'https:',
   slashes: true,
@@ -35,8 +44,24 @@ for (const appName of APPS_TO_ALIAS) {
 REPLACEMENTS.push([/\/c:\\projects\\src\\out\\default\\/g, '/']);
 REPLACEMENTS.push([/\/c%3a%5cprojects%5csrc%5cout%5cdefault%5c/g, '/']);
 
+// Bound the negative cache by total bytes rather than entry count so its
+// worst-case memory footprint stays predictable on a small dyno. In
+// lru-cache@6, providing a `length` calculator makes `max` a total-length
+// budget. Charging only the key's string length badly undercounts real heap:
+// each entry also costs an lru-cache linked-list node, a Map entry, and V8
+// string/object headers. Measured with node --expose-gc on lru-cache@6 using
+// representative 96-char keys filled to steady-state eviction: ~480-510 bytes
+// of heapUsed per entry, i.e. roughly 384 bytes of overhead beyond the key
+// itself. Charging key.length alone allowed ~350k entries and ~160 MiB of
+// real heap against this 32 MiB budget; charging the measured overhead keeps
+// a full cache at ~70k entries and ~34 MiB of measured heap.
+const MISSING_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const MISSING_CACHE_ENTRY_OVERHEAD_BYTES = 384;
+
 const missingSymbolCache = new LRU<string, boolean>({
-  max: 10000,
+  max: MISSING_CACHE_MAX_BYTES,
+  length: (_value, key) => (key as string).length + MISSING_CACHE_ENTRY_OVERHEAD_BYTES,
+  maxAge: MISSING_SYMBOL_TTL_SECONDS * 1000,
 });
 
 function incomingPathToProxyPath(path: string): string {
@@ -76,10 +101,14 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   const originalWriteHead = response.writeHead;
   response.writeHead = (...args: [number, any]) => {
     if (args[0] == 403) {
+      // Only genuine misses go in the negative cache. Hits and transport
+      // errors used to be stored as `false`, which answered no query the
+      // cache's absence wouldn't, but still consumed an LRU slot each.
       missingSymbolCache.set(proxyReq.path, true);
       args[0] = 404;
-    } else {
-      missingSymbolCache.set(proxyReq.path, false);
+      response.setHeader('Cache-Control', MISSING_CACHE_CONTROL);
+    } else if (args[0] == 200 && !response.getHeader('cache-control')) {
+      response.setHeader('Cache-Control', HIT_CACHE_CONTROL);
     }
     return originalWriteHead.apply(response, args);
   };
@@ -89,6 +118,11 @@ proxy.on('error', (err, req, res) => {
   const errorId = crypto.randomUUID();
 
   console.error('Error:', errorId, 'Request:', req.url, err);
+
+  // The client may already be gone (disconnected mid-proxy) by the time the
+  // upstream request fails; writing headers to a closed/finished response
+  // would throw.
+  if (res.destroyed || res.writableEnded || res.headersSent) return;
 
   res.writeHead(500, {
     'Content-Type': 'text/plain'
@@ -114,11 +148,20 @@ http.createServer((req, res) => {
       host: TARGET_HOST,
       pathname: cacheKey,
     }));
+    // Only Cloudflare may cache these redirects: its cache key (electron/infra
+    // cache ruleset) separates the redirect cohort on both triggers of this
+    // branch, so a cached 302 cannot leak to ordinary clients. Generic shared
+    // caches and browsers key on URL alone, so they get no-store, while
+    // Cloudflare-CDN-Cache-Control — Cloudflare-specific, preferred by
+    // Cloudflare over Cache-Control, and not forwarded downstream — keeps the
+    // edge caching the redirect for an hour.
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Cloudflare-CDN-Cache-Control', MISSING_CACHE_CONTROL);
     return res.writeHead(302).end();
   }
 
   if (missingSymbolCache.get(cacheKey)) {
-    return res.writeHead(404).end();
+    return res.writeHead(404, { 'Cache-Control': MISSING_CACHE_CONTROL }).end();
   }
 
   proxy.web(req, res, { target: TARGET_URL });

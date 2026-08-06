@@ -177,6 +177,64 @@ test('upstream non-403 errors are passed through and not cached as missing', asy
   assert.equal(calls, 2);
 });
 
+test('negative-cache 404s carry a public Cache-Control header', async (t) => {
+  const { server } = await startProxy(t, {
+    handler: (req, res) => {
+      res.writeHead(403);
+      res.end();
+    },
+  });
+
+  const first = await request(server.port, '/missing/foo.pdb/abc/foo.pdb');
+  assert.equal(first.statusCode, 404);
+  assert.equal(first.headers['cache-control'], 'public, max-age=3600');
+
+  // Served from the negative cache without contacting upstream.
+  const second = await request(server.port, '/missing/foo.pdb/abc/foo.pdb');
+  assert.equal(second.statusCode, 404);
+  assert.equal(second.headers['cache-control'], 'public, max-age=3600');
+});
+
+test('successful 200s get a long immutable Cache-Control when upstream sends none', async (t) => {
+  const { server } = await startProxy(t, {
+    handler: (req, res) => {
+      res.writeHead(200);
+      res.end('SYMBOL-DATA');
+    },
+  });
+
+  const res = await request(server.port, '/foo/bar.pdb/abc/foo.pdb');
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['cache-control'], 'public, max-age=604800, immutable');
+});
+
+test('upstream Cache-Control on 200s is preserved', async (t) => {
+  const { server } = await startProxy(t, {
+    handler: (req, res) => {
+      res.writeHead(200, { 'cache-control': 'public, max-age=60' });
+      res.end('SYMBOL-DATA');
+    },
+  });
+
+  const res = await request(server.port, '/foo/bar.pdb/abc/foo.pdb');
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['cache-control'], 'public, max-age=60');
+});
+
+test('redirect responses are cacheable by Cloudflare only', async (t) => {
+  const server = await startSymbolServer({ targetHost: 'symbols.example.test' });
+  t.after(() => server.stop());
+
+  const res = await request(server.port, '/Foo/Bar', {
+    'user-agent': 'symbolicator/1.2.3',
+  });
+  assert.equal(res.statusCode, 302);
+  // Generic shared caches and browsers must never store the redirect...
+  assert.equal(res.headers['cache-control'], 'no-store');
+  // ...while Cloudflare (whose cache key separates the redirect cohort) may.
+  assert.equal(res.headers['cloudflare-cdn-cache-control'], 'public, max-age=3600');
+});
+
 test('proxy returns 500 with error ID when upstream is unreachable', async (t) => {
   const server = await startSymbolServer({ targetHost: '127.0.0.1:1' });
   t.after(() => server.stop());
