@@ -225,7 +225,8 @@ http.createServer((req, res) => {
       host: TARGET_HOST,
       pathname: cacheKey,
     }));
-    res.setHeader('Cache-Control', 'no-store');
+    // Cloudflare caches these 302s at the edge per UA cohort; Location depends only on the path.
+    res.setHeader('Cache-Control', MISSING_CACHE_CONTROL);
     return res.writeHead(302).end();
   }
 
