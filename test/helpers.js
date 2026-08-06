@@ -70,9 +70,6 @@ function startUpstream(handler) {
         requests,
         close: () =>
           new Promise((res) => {
-            // Sever any connections still open (e.g. leaked by a bug under
-            // test) so close() cannot hang the test runner's after-hooks.
-            server.closeAllConnections();
             server.close(() => res());
           }),
       });
@@ -80,12 +77,11 @@ function startUpstream(handler) {
   });
 }
 
-async function startSymbolServer({ targetHost, pathPrefix, env: extraEnv } = {}) {
+async function startSymbolServer({ targetHost, pathPrefix } = {}) {
   const port = await getFreePort();
 
   const env = {
     ...process.env,
-    ...extraEnv,
     TARGET_HOST: targetHost,
     PORT: String(port),
     // http-proxy uses the default https agent; NODE_EXTRA_CA_CERTS is the
@@ -138,14 +134,14 @@ async function startSymbolServer({ targetHost, pathPrefix, env: extraEnv } = {})
 
 // Spawn an upstream + symbol-server pair and register cleanup with the test
 // context. Returns { server, upstream }.
-async function startProxy(t, { handler, pathPrefix, env } = {}) {
+async function startProxy(t, { handler, pathPrefix } = {}) {
   const upstream = await startUpstream(handler || ((req, res) => {
     res.writeHead(200);
     res.end('ok');
   }));
   t.after(() => upstream.close());
 
-  const server = await startSymbolServer({ targetHost: upstream.host, pathPrefix, env });
+  const server = await startSymbolServer({ targetHost: upstream.host, pathPrefix });
   t.after(() => server.stop());
 
   return { server, upstream };
