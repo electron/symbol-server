@@ -221,7 +221,7 @@ test('upstream Cache-Control on 200s is preserved', async (t) => {
   assert.equal(res.headers['cache-control'], 'public, max-age=60');
 });
 
-test('redirect responses are edge-cacheable', async (t) => {
+test('redirect responses are cacheable by Cloudflare only', async (t) => {
   const server = await startSymbolServer({ targetHost: 'symbols.example.test' });
   t.after(() => server.stop());
 
@@ -229,7 +229,10 @@ test('redirect responses are edge-cacheable', async (t) => {
     'user-agent': 'symbolicator/1.2.3',
   });
   assert.equal(res.statusCode, 302);
-  assert.equal(res.headers['cache-control'], 'public, max-age=3600');
+  // Generic shared caches and browsers must never store the redirect...
+  assert.equal(res.headers['cache-control'], 'no-store');
+  // ...while Cloudflare (whose cache key separates the redirect cohort) may.
+  assert.equal(res.headers['cloudflare-cdn-cache-control'], 'public, max-age=3600');
 });
 
 test('proxy returns 500 with error ID when upstream is unreachable', async (t) => {

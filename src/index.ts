@@ -148,8 +148,15 @@ http.createServer((req, res) => {
       host: TARGET_HOST,
       pathname: cacheKey,
     }));
-    // Cloudflare caches these 302s at the edge per UA cohort; Location depends only on the path.
-    res.setHeader('Cache-Control', MISSING_CACHE_CONTROL);
+    // Only Cloudflare may cache these redirects: its cache key (electron/infra
+    // cache ruleset) separates the redirect cohort on both triggers of this
+    // branch, so a cached 302 cannot leak to ordinary clients. Generic shared
+    // caches and browsers key on URL alone, so they get no-store, while
+    // Cloudflare-CDN-Cache-Control — Cloudflare-specific, preferred by
+    // Cloudflare over Cache-Control, and not forwarded downstream — keeps the
+    // edge caching the redirect for an hour.
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Cloudflare-CDN-Cache-Control', MISSING_CACHE_CONTROL);
     return res.writeHead(302).end();
   }
 
