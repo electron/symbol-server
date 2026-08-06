@@ -260,6 +260,68 @@ test('sheds load with 503 + Retry-After above the upstream concurrency cap', asy
   assert.equal(held.statusCode, 200);
 });
 
+test('same-path dedup waiters cannot bypass the upstream concurrency cap', async (t) => {
+  // Regression test: waiters queued behind an in-flight leader used to all
+  // call proxyToUpstream when the leader settled. Each overwrote the same
+  // in-flight map key, so the Map.size-based cap check saw 1 while N upstream
+  // requests were actually active (observed: 6 with a cap of 2).
+  let active = 0;
+  let maxActive = 0;
+  let phase = 'leader';
+  let releaseLeader;
+  const leaderHeld = new Promise((resolve) => { releaseLeader = resolve; });
+  let releaseWaiters;
+  const waitersHeld = new Promise((resolve) => { releaseWaiters = resolve; });
+
+  const { server, upstream } = await startProxy(t, {
+    env: { MAX_UPSTREAM_CONCURRENCY: '2' },
+    handler: async (req, res) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      if (phase === 'leader') await leaderHeld; else await waitersHeld;
+      res.writeHead(200);
+      res.end('ok');
+      active -= 1;
+    },
+  });
+
+  const PATH = '/stampede/foo.pdb/abc/foo.pdb';
+  const leader = request(server.port, PATH);
+  while (upstream.requests.length === 0) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  // Queue six identical lookups; all should dedup-wait on the leader.
+  phase = 'waiters';
+  const waiters = [];
+  for (let i = 0; i < 6; i++) waiters.push(request(server.port, PATH));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(upstream.requests.length, 1, 'waiters must not reach upstream while leader is in flight');
+
+  // Leader succeeds; woken waiters re-check the cap, so only two may proxy.
+  releaseLeader();
+  const deadline = Date.now() + 2000;
+  while (upstream.requests.length < 3 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  // Grace period to catch any waiters that slipped past the cap.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  releaseWaiters();
+
+  const leaderRes = await leader;
+  const waiterRes = await Promise.all(waiters);
+
+  assert.equal(leaderRes.statusCode, 200);
+  assert.ok(maxActive <= 2, `at most 2 simultaneous upstream requests allowed, saw ${maxActive}`);
+  assert.equal(upstream.requests.length, 3, 'leader + at most cap-many waiters may reach upstream');
+
+  const okCount = waiterRes.filter((r) => r.statusCode === 200).length;
+  const shed = waiterRes.filter((r) => r.statusCode === 503);
+  assert.equal(okCount, 2, 'exactly cap-many waiters should be proxied');
+  assert.equal(shed.length, 4, 'remaining waiters should be shed');
+  for (const r of shed) assert.equal(r.headers['retry-after'], '30');
+});
+
 test('concurrent requests for the same missing path only hit upstream once', async (t) => {
   const { server, upstream } = await startProxy(t, {
     handler: (req, res) => {

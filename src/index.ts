@@ -50,15 +50,29 @@ for (const appName of APPS_TO_ALIAS) {
 REPLACEMENTS.push([/\/c:\\projects\\src\\out\\default\\/g, '/']);
 REPLACEMENTS.push([/\/c%3a%5cprojects%5csrc%5cout%5cdefault%5c/g, '/']);
 
+// Bound the negative cache by total bytes rather than entry count so its
+// worst-case memory footprint stays predictable on a small dyno. In
+// lru-cache@6, providing a `length` calculator makes `max` a total-length
+// budget; we charge each entry the string length of its path key (the boolean
+// value is negligible). Rewritten symbol paths are ~60-100 bytes, so 32 MiB is
+// roughly 300-500k entries worst case, but bounded in bytes either way.
+const MISSING_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+
 const missingSymbolCache = new LRU<string, boolean>({
-  max: 500_000,
+  max: MISSING_CACHE_MAX_BYTES,
+  length: (_value, key) => (key as string).length,
   maxAge: MISSING_SYMBOL_TTL_SECONDS * 1000,
 });
 
 // Proxied requests currently awaiting an upstream response, keyed by rewritten
-// path. Used to dedupe identical concurrent lookups and to enforce the
-// upstream concurrency cap.
+// path. Used only to dedupe identical concurrent lookups — NOT for the
+// concurrency cap: multiple proxied requests for the same path share a single
+// map entry, so Map.size undercounts.
 const inFlightRequests = new Map<string, Promise<void>>();
+
+// Number of proxied upstream requests actually in flight right now. This is
+// what the concurrency cap is enforced against.
+let activeUpstreamRequests = 0;
 
 function incomingPathToProxyPath(path: string): string {
   // symstore.exe and symsrv.dll don't always agree on the case of the path to a
@@ -97,14 +111,14 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   const originalWriteHead = response.writeHead;
   response.writeHead = (...args: [number, any]) => {
     if (args[0] == 403) {
+      // Only genuine misses go in the negative cache. Hits and transport
+      // errors used to be stored as `false`, which answered no query the
+      // cache's absence wouldn't, but still consumed an LRU slot each.
       missingSymbolCache.set(proxyReq.path, true);
       args[0] = 404;
       response.setHeader('Cache-Control', MISSING_CACHE_CONTROL);
-    } else {
-      missingSymbolCache.set(proxyReq.path, false);
-      if (args[0] == 200 && !response.getHeader('cache-control')) {
-        response.setHeader('Cache-Control', HIT_CACHE_CONTROL);
-      }
+    } else if (args[0] == 200 && !response.getHeader('cache-control')) {
+      response.setHeader('Cache-Control', HIT_CACHE_CONTROL);
     }
     return originalWriteHead.apply(response, args);
   };
@@ -149,7 +163,9 @@ http.createServer((req, res) => {
 
   // If an identical lookup is already being proxied, wait for it to settle
   // rather than launching a duplicate upstream fetch. If it negative-cached
-  // the path we can answer 404 for free, otherwise proxy as usual.
+  // the path we can answer 404 for free, otherwise proxy as usual —
+  // proxyToUpstream re-checks the concurrency cap when we wake, so a stampede
+  // of same-path waiters is shed instead of all proxying at once.
   const inFlight = inFlightRequests.get(cacheKey);
   if (inFlight) {
     inFlight.then(() => {
@@ -165,19 +181,38 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT || 8080);
 
 function proxyToUpstream(req: http.IncomingMessage, res: http.ServerResponse, cacheKey: string) {
-  if (inFlightRequests.size >= UPSTREAM_CONCURRENCY_LIMIT) {
+  if (activeUpstreamRequests >= UPSTREAM_CONCURRENCY_LIMIT) {
     // Shed load immediately instead of queueing behind a saturated upstream,
     // otherwise the router backlog fills up and everyone gets H11 503s.
     res.setHeader('Retry-After', String(RETRY_AFTER_SECONDS));
     return res.writeHead(503).end('Too many concurrent symbol requests, retry later');
   }
 
-  inFlightRequests.set(cacheKey, new Promise((resolve) => {
-    res.on('close', () => {
-      inFlightRequests.delete(cacheKey);
+  activeUpstreamRequests++;
+  const inFlight = new Promise<void>((resolve) => {
+    // Both 'close' and 'error' can fire for the same response; settle exactly
+    // once so the active count can never be decremented twice.
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      activeUpstreamRequests--;
+      // Several proxied requests for the same path can coexist (dedup waiters
+      // that woke below the cap); only the one registered in the map may
+      // remove the entry, or a later request's dedup entry would be dropped
+      // while it is still in flight.
+      if (inFlightRequests.get(cacheKey) === inFlight) {
+        inFlightRequests.delete(cacheKey);
+      }
       resolve();
-    });
-  }));
+    };
+    res.on('close', settle);
+    res.on('error', settle);
+  });
+
+  if (!inFlightRequests.has(cacheKey)) {
+    inFlightRequests.set(cacheKey, inFlight);
+  }
 
   proxy.web(req, res, { target: TARGET_URL });
 }
