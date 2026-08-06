@@ -97,9 +97,8 @@ async function startSymbolServer({ targetHost, pathPrefix, env: extraEnv } = {})
   else delete env.PATH_PREFIX;
 
   const stderrChunks = [];
-  const stdoutChunks = [];
   const child = spawn(process.execPath, [SERVER_ENTRY], { env });
-  child.stdout.on('data', (d) => stdoutChunks.push(d));
+  child.stdout.on('data', () => {});
   child.stderr.on('data', (d) => stderrChunks.push(d));
 
   let exited = false;
@@ -125,9 +124,6 @@ async function startSymbolServer({ targetHost, pathPrefix, env: extraEnv } = {})
 
   return {
     port,
-    // Everything the server has written to stdout so far (e.g. sampled
-    // request logs), as a string.
-    stdout: () => Buffer.concat(stdoutChunks).toString(),
     stop: () =>
       new Promise((resolve) => {
         if (exited) return resolve();

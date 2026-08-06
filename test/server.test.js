@@ -444,40 +444,6 @@ test('concurrent requests for the same missing path only hit upstream once', asy
   assert.equal(upstream.requests.length, 1, 'duplicate lookup should not reach upstream');
 });
 
-test('sampled request log fires at the configured cadence and includes the user-agent', async (t) => {
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const { server } = await startProxy(t, {
-    env: { UA_LOG_SAMPLE_RATE: '5' },
-    handler: (req, res) => {
-      res.writeHead(200);
-      res.end('ok');
-    },
-  });
-
-  const UA = 'symsrv-test/2.0 ("Windows")';
-  for (let i = 0; i < 12; i++) {
-    const res = await request(server.port, `/sampled/foo.pdb/abc/foo-${i}.pdb`, {
-      'user-agent': UA,
-    });
-    assert.equal(res.statusCode, 200);
-  }
-
-  // The modulo counter samples requests 1, 6 and 11 of the 12. Poll briefly:
-  // the child's stdout pipe delivers asynchronously.
-  let lines;
-  const deadline = Date.now() + 2000;
-  do {
-    lines = server.stdout().split('\n').filter((l) => l.startsWith('request-sample '));
-    if (lines.length >= 3) break;
-    await sleep(20);
-  } while (Date.now() < deadline);
-
-  assert.equal(lines.length, 3, `expected 3 sampled lines for 12 requests at 1/5, got:\n${server.stdout()}`);
-  for (const line of lines) {
-    assert.match(line, /^request-sample method=GET path=\/sampled\/foo\.pdb\/abc\/foo-\d+\.pdb disposition=proxied ua="symsrv-test\/2\.0 \(\\"Windows\\"\)"$/);
-  }
-});
-
 test('proxy returns 500 with error ID when upstream is unreachable', async (t) => {
   const server = await startSymbolServer({ targetHost: '127.0.0.1:1' });
   t.after(() => server.stop());

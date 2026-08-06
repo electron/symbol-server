@@ -5,7 +5,7 @@ import httpProxy from 'http-proxy';
 import LRU from 'lru-cache';
 import * as url from 'url';
 
-const { PATH_PREFIX, TARGET_HOST, MAX_UPSTREAM_CONCURRENCY, UA_LOG_SAMPLE_RATE } = process.env;
+const { PATH_PREFIX, TARGET_HOST, MAX_UPSTREAM_CONCURRENCY } = process.env;
 
 assert(TARGET_HOST, 'TARGET_HOST is defined');
 
@@ -23,13 +23,6 @@ const HIT_CACHE_CONTROL = 'public, max-age=604800, immutable';
 // shallow during floods.
 const UPSTREAM_CONCURRENCY_LIMIT = parseInt(MAX_UPSTREAM_CONCURRENCY || '', 10) || 100;
 const RETRY_AFTER_SECONDS = 30;
-
-// Log roughly 1 in N requests. The service fields ~13M requests/day, so
-// logging every one would swamp the log drain; a sampled line is enough to
-// see which user agents are hitting us and how their requests are answered.
-// Sampling uses a modulo counter rather than Math.random so the cadence is
-// deterministic and testable.
-const REQUEST_LOG_SAMPLE_RATE = parseInt(UA_LOG_SAMPLE_RATE || '', 10) || 1000;
 
 const TARGET_URL = url.format({
   protocol: 'https:',
@@ -193,20 +186,6 @@ proxy.on('error', (err, req, res) => {
   res.end(`Something went wrong. If this happens consistently please report to https://github.com/electron/symbol-server with this error ID: "${errorId}"`);
 });
 
-// Called once per request at the point where its disposition (redirect,
-// cached-404, shed, proxied) becomes cheaply known; every
-// REQUEST_LOG_SAMPLE_RATE-th call emits a single greppable line. The
-// User-Agent is stripped of newlines and has quotes escaped so the ua="..."
-// field always stays on one line and cannot be broken out of.
-let sampledRequestCount = 0;
-
-function sampleRequestLog(req: http.IncomingMessage, disposition: string) {
-  if (sampledRequestCount++ % REQUEST_LOG_SAMPLE_RATE !== 0) return;
-  const userAgent = req.headers['user-agent'];
-  const ua = userAgent ? userAgent.replace(/[\r\n]+/g, ' ').replace(/"/g, '\\"') : '-';
-  console.log(`request-sample method=${req.method} path=${req.url} disposition=${disposition} ua="${ua}"`);
-}
-
 http.createServer((req, res) => {
   const parsed = new url.URL(`http://localhost${req.url!}`);
   if (parsed.pathname === '/health') {
@@ -218,7 +197,6 @@ http.createServer((req, res) => {
   const isSentryRequest = userAgent && userAgent.startsWith('symbolicator/');
 
   if (isSentryRequest || req.headers['x-electron-symbol-redirect'] === '1') {
-    sampleRequestLog(req, 'redirect');
     res.setHeader('Location', url.format({
       protocol: 'https:',
       slashes: true,
@@ -231,7 +209,6 @@ http.createServer((req, res) => {
   }
 
   if (missingSymbolCache.get(cacheKey)) {
-    sampleRequestLog(req, 'cached-404');
     return res.writeHead(404, { 'Cache-Control': MISSING_CACHE_CONTROL }).end();
   }
 
@@ -251,7 +228,6 @@ http.createServer((req, res) => {
       // nothing to clean up.
       if (clientGone(req, res)) return;
       if (missingSymbolCache.get(cacheKey)) {
-        sampleRequestLog(req, 'cached-404');
         return res.writeHead(404, { 'Cache-Control': MISSING_CACHE_CONTROL }).end();
       }
       proxyToUpstream(req, res, cacheKey);
@@ -284,7 +260,6 @@ function proxyToUpstream(req: http.IncomingMessage, res: http.ServerResponse, ca
   if (activeUpstreamRequests >= UPSTREAM_CONCURRENCY_LIMIT) {
     // Shed load immediately instead of queueing behind a saturated upstream,
     // otherwise the router backlog fills up and everyone gets H11 503s.
-    sampleRequestLog(req, 'shed');
     res.setHeader('Retry-After', String(RETRY_AFTER_SECONDS));
     return res.writeHead(503).end('Too many concurrent symbol requests, retry later');
   }
@@ -358,7 +333,6 @@ function proxyToUpstream(req: http.IncomingMessage, res: http.ServerResponse, ca
     return;
   }
 
-  sampleRequestLog(req, 'proxied');
   proxy.web(req, res, { target: TARGET_URL });
 }
 
