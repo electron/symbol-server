@@ -1,5 +1,6 @@
 'use strict';
 
+const http = require('node:http');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
@@ -320,6 +321,49 @@ test('same-path dedup waiters cannot bypass the upstream concurrency cap', async
   assert.equal(okCount, 2, 'exactly cap-many waiters should be proxied');
   assert.equal(shed.length, 4, 'remaining waiters should be shed');
   for (const r of shed) assert.equal(r.headers['retry-after'], '30');
+});
+
+test('a dedup waiter whose client disconnects mid-wait does not leak an upstream slot', async (t) => {
+  // Regression test: a same-path waiter used to call proxyToUpstream when the
+  // leader settled even if its own client had already hung up. The response's
+  // 'close' event had fired before the settle listeners were registered, so
+  // settle never ran and the incremented activeUpstreamRequests slot leaked
+  // forever. With a cap of 1 a single canceled waiter then turned every
+  // subsequent distinct-path request into a 503 until process restart.
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  let phase = 'leader';
+  let releaseLeader;
+  const leaderHeld = new Promise((resolve) => { releaseLeader = resolve; });
+  const { server, upstream } = await startProxy(t, {
+    env: { MAX_UPSTREAM_CONCURRENCY: '1' },
+    handler: async (req, res) => {
+      if (phase === 'leader') await leaderHeld;
+      res.writeHead(200);
+      res.end('ok');
+    },
+  });
+
+  const PATH = '/held/foo.pdb/abc/foo.pdb';
+  const leader = request(server.port, PATH);
+  while (upstream.requests.length === 0) await sleep(10);
+
+  // Same-path waiter; destroy its client socket while it waits on the leader.
+  const waiter = http.request({ host: '127.0.0.1', port: server.port, path: PATH, method: 'GET' });
+  waiter.on('error', () => {});
+  waiter.end();
+  await sleep(200); // let the server register it as a dedup waiter
+  waiter.destroy();
+  await sleep(200); // let the server-side 'close' fire
+
+  phase = 'done';
+  releaseLeader();
+  const leaderRes = await leader;
+  assert.equal(leaderRes.statusCode, 200);
+  await sleep(200); // let the canceled waiter wake and (previously) leak
+
+  const probe = await request(server.port, '/distinct/bar.pdb/def/bar.pdb');
+  assert.equal(probe.statusCode, 200, 'canceled waiter must not leak an upstream slot');
+  assert.equal(upstream.requests.length, 2, 'only the leader and the probe should reach upstream');
 });
 
 test('concurrent requests for the same missing path only hit upstream once', async (t) => {

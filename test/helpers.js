@@ -70,6 +70,9 @@ function startUpstream(handler) {
         requests,
         close: () =>
           new Promise((res) => {
+            // Sever any connections still open (e.g. leaked by a bug under
+            // test) so close() cannot hang the test runner's after-hooks.
+            server.closeAllConnections();
             server.close(() => res());
           }),
       });

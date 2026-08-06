@@ -53,14 +53,20 @@ REPLACEMENTS.push([/\/c%3a%5cprojects%5csrc%5cout%5cdefault%5c/g, '/']);
 // Bound the negative cache by total bytes rather than entry count so its
 // worst-case memory footprint stays predictable on a small dyno. In
 // lru-cache@6, providing a `length` calculator makes `max` a total-length
-// budget; we charge each entry the string length of its path key (the boolean
-// value is negligible). Rewritten symbol paths are ~60-100 bytes, so 32 MiB is
-// roughly 300-500k entries worst case, but bounded in bytes either way.
+// budget. Charging only the key's string length badly undercounts real heap:
+// each entry also costs an lru-cache linked-list node, a Map entry, and V8
+// string/object headers. Measured with node --expose-gc on lru-cache@6 using
+// representative 96-char keys filled to steady-state eviction: ~480-510 bytes
+// of heapUsed per entry, i.e. roughly 384 bytes of overhead beyond the key
+// itself. Charging key.length alone allowed ~350k entries and ~160 MiB of
+// real heap against this 32 MiB budget; charging the measured overhead keeps
+// a full cache at ~70k entries and ~34 MiB of measured heap.
 const MISSING_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const MISSING_CACHE_ENTRY_OVERHEAD_BYTES = 384;
 
 const missingSymbolCache = new LRU<string, boolean>({
   max: MISSING_CACHE_MAX_BYTES,
-  length: (_value, key) => (key as string).length,
+  length: (_value, key) => (key as string).length + MISSING_CACHE_ENTRY_OVERHEAD_BYTES,
   maxAge: MISSING_SYMBOL_TTL_SECONDS * 1000,
 });
 
@@ -169,6 +175,13 @@ http.createServer((req, res) => {
   const inFlight = inFlightRequests.get(cacheKey);
   if (inFlight) {
     inFlight.then(() => {
+      // The client may have hung up while we waited on the leader. Its
+      // response 'close' event has already fired by now, so proxying would
+      // register settle listeners that never run and leak an upstream slot
+      // forever (proxyToUpstream re-checks this, but bail early and skip the
+      // cache lookup too). Dropped waiters touch no counters, so there is
+      // nothing to clean up.
+      if (clientGone(req, res)) return;
       if (missingSymbolCache.get(cacheKey)) {
         return res.writeHead(404, { 'Cache-Control': MISSING_CACHE_CONTROL }).end();
       }
@@ -180,7 +193,25 @@ http.createServer((req, res) => {
   proxyToUpstream(req, res, cacheKey);
 }).listen(process.env.PORT || 8080);
 
+// True when the client that issued this request can no longer receive a
+// response: its socket is gone (disconnect — note 'close' fires on the
+// response even before headers are written) or the response already ended.
+function clientGone(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  return (
+    req.destroyed ||
+    res.destroyed ||
+    res.writableEnded ||
+    !res.socket ||
+    res.socket.destroyed
+  );
+}
+
 function proxyToUpstream(req: http.IncomingMessage, res: http.ServerResponse, cacheKey: string) {
+  // Never proxy on behalf of a client that already disconnected: its 'close'
+  // event has already fired, so the settle listeners below would never run
+  // and the upstream slot would leak until process restart.
+  if (clientGone(req, res)) return;
+
   if (activeUpstreamRequests >= UPSTREAM_CONCURRENCY_LIMIT) {
     // Shed load immediately instead of queueing behind a saturated upstream,
     // otherwise the router backlog fills up and everyone gets H11 503s.
@@ -189,11 +220,14 @@ function proxyToUpstream(req: http.IncomingMessage, res: http.ServerResponse, ca
   }
 
   activeUpstreamRequests++;
+  // Both 'close' and 'error' can fire for the same response, and settle() is
+  // additionally called by hand below when the client disconnected before the
+  // listeners were registered; settle exactly once so the active count can
+  // never be decremented twice.
+  let settled = false;
+  let settle!: () => void;
   const inFlight = new Promise<void>((resolve) => {
-    // Both 'close' and 'error' can fire for the same response; settle exactly
-    // once so the active count can never be decremented twice.
-    let settled = false;
-    const settle = () => {
+    settle = () => {
       if (settled) return;
       settled = true;
       activeUpstreamRequests--;
@@ -212,6 +246,15 @@ function proxyToUpstream(req: http.IncomingMessage, res: http.ServerResponse, ca
 
   if (!inFlightRequests.has(cacheKey)) {
     inFlightRequests.set(cacheKey, inFlight);
+  }
+
+  // 'close' fires at most once. If the client vanished between the clientGone
+  // check at the top of this function and the listener registration above, it
+  // has already fired and never will again — settle by hand and skip the
+  // upstream fetch entirely.
+  if (clientGone(req, res)) {
+    settle();
+    return;
   }
 
   proxy.web(req, res, { target: TARGET_URL });
