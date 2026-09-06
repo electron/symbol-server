@@ -242,7 +242,53 @@ test('proxy returns 500 with error ID when upstream is unreachable', async (t) =
   const res = await request(server.port, '/foo/bar/abc/file.pdb');
   assert.equal(res.statusCode, 500);
   assert.equal(res.headers['content-type'], 'text/plain');
+  assert.equal(res.headers['cache-control'], 'no-store');
   assert.match(res.body, /Something went wrong.*error ID: "[0-9a-f-]+"/i);
+});
+
+test('a stalled upstream times out and returns an uncacheable 504', async (t) => {
+  const { server } = await startProxy(t, {
+    // Accept the request, then never respond — no error event, the socket
+    // just sits idle (the H12 hang shape seen in production).
+    handler: () => {},
+    extraEnv: { UPSTREAM_TIMEOUT_MS: '500' },
+  });
+
+  const started = Date.now();
+  const res = await request(server.port, '/foo/bar.pdb/abc/foo.pdb');
+  const elapsed = Date.now() - started;
+
+  assert.equal(res.statusCode, 504);
+  assert.equal(res.headers['cache-control'], 'no-store');
+  assert.match(res.body, /Something went wrong.*error ID: "[0-9a-f-]+"/i);
+  assert.ok(
+    elapsed >= 400 && elapsed < 5000,
+    `expected the request to fail at the ~500ms timeout, took ${elapsed}ms`,
+  );
+});
+
+test('slowly flowing responses are not killed by the inactivity timeout', async (t) => {
+  // The timeout is inactivity-based: each chunk resets it, so a download that
+  // takes longer than UPSTREAM_TIMEOUT_MS in total still completes.
+  const { server } = await startProxy(t, {
+    handler: (req, res) => {
+      res.writeHead(200);
+      let sent = 0;
+      const interval = setInterval(() => {
+        res.write('chunk');
+        sent += 1;
+        if (sent === 4) {
+          clearInterval(interval);
+          res.end();
+        }
+      }, 300);
+    },
+    extraEnv: { UPSTREAM_TIMEOUT_MS: '500' },
+  });
+
+  const res = await request(server.port, '/foo/bar.pdb/abc/foo.pdb');
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body, 'chunk'.repeat(4));
 });
 
 test('asserts when TARGET_HOST is missing', async () => {
