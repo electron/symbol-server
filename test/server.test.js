@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('http');
 
 const { startSymbolServer, startProxy, request } = require('./helpers');
 
@@ -242,7 +243,100 @@ test('proxy returns 500 with error ID when upstream is unreachable', async (t) =
   const res = await request(server.port, '/foo/bar/abc/file.pdb');
   assert.equal(res.statusCode, 500);
   assert.equal(res.headers['content-type'], 'text/plain');
+  assert.equal(res.headers['cache-control'], 'no-store');
   assert.match(res.body, /Something went wrong.*error ID: "[0-9a-f-]+"/i);
+});
+
+test('a stalled upstream times out and returns an uncacheable 504', async (t) => {
+  const { server } = await startProxy(t, {
+    // Accept the request, then never respond — no error event, the socket
+    // just sits idle (the H12 hang shape seen in production).
+    handler: () => {},
+    extraEnv: { UPSTREAM_TIMEOUT_MS: '500' },
+  });
+
+  const started = Date.now();
+  const res = await request(server.port, '/foo/bar.pdb/abc/foo.pdb');
+  const elapsed = Date.now() - started;
+
+  assert.equal(res.statusCode, 504);
+  assert.equal(res.headers['cache-control'], 'no-store');
+  assert.match(res.body, /Something went wrong.*error ID: "[0-9a-f-]+"/i);
+  assert.ok(
+    elapsed >= 400 && elapsed < 5000,
+    `expected the request to fail at the ~500ms timeout, took ${elapsed}ms`,
+  );
+});
+
+test('slowly flowing responses are not killed by the inactivity timeout', async (t) => {
+  // The timeout is inactivity-based: each chunk resets it, so a download that
+  // takes longer than UPSTREAM_TIMEOUT_MS in total still completes.
+  const { server } = await startProxy(t, {
+    handler: (req, res) => {
+      res.writeHead(200);
+      let sent = 0;
+      const interval = setInterval(() => {
+        res.write('chunk');
+        sent += 1;
+        if (sent === 4) {
+          clearInterval(interval);
+          res.end();
+        }
+      }, 300);
+    },
+    extraEnv: { UPSTREAM_TIMEOUT_MS: '500' },
+  });
+
+  const res = await request(server.port, '/foo/bar.pdb/abc/foo.pdb');
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body, 'chunk'.repeat(4));
+});
+
+test('an upstream that stalls mid-body terminates the client connection', async (t) => {
+  // Headers and part of the body have already been forwarded when the upstream
+  // goes quiet, so a 504 can't follow; the client connection must be torn down
+  // rather than left hanging on a truncated, unterminated body.
+  const { server } = await startProxy(t, {
+    handler: (req, res) => {
+      res.writeHead(200);
+      res.write('partial');
+      // ...then stall forever.
+    },
+    extraEnv: { UPSTREAM_TIMEOUT_MS: '500' },
+  });
+
+  const started = Date.now();
+  const outcome = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('client response hung')), 5000);
+    const req = http.request(
+      { host: '127.0.0.1', port: server.port, path: '/foo/bar.pdb/abc/foo.pdb' },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('aborted', () => {
+          clearTimeout(timer);
+          resolve({ statusCode: res.statusCode, body: Buffer.concat(chunks).toString() });
+        });
+        res.on('end', () => {
+          clearTimeout(timer);
+          reject(new Error('response ended cleanly; expected an aborted transfer'));
+        });
+      },
+    );
+    req.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    req.end();
+  });
+  const elapsed = Date.now() - started;
+
+  assert.equal(outcome.statusCode, 200);
+  assert.equal(outcome.body, 'partial');
+  assert.ok(
+    elapsed >= 400 && elapsed < 5000,
+    `expected the connection to be terminated at the ~500ms timeout, took ${elapsed}ms`,
+  );
 });
 
 test('asserts when TARGET_HOST is missing', async () => {
