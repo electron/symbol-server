@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('http');
 
 const { startSymbolServer, startProxy, request } = require('./helpers');
 
@@ -289,6 +290,53 @@ test('slowly flowing responses are not killed by the inactivity timeout', async 
   const res = await request(server.port, '/foo/bar.pdb/abc/foo.pdb');
   assert.equal(res.statusCode, 200);
   assert.equal(res.body, 'chunk'.repeat(4));
+});
+
+test('an upstream that stalls mid-body terminates the client connection', async (t) => {
+  // Headers and part of the body have already been forwarded when the upstream
+  // goes quiet, so a 504 can't follow; the client connection must be torn down
+  // rather than left hanging on a truncated, unterminated body.
+  const { server } = await startProxy(t, {
+    handler: (req, res) => {
+      res.writeHead(200);
+      res.write('partial');
+      // ...then stall forever.
+    },
+    extraEnv: { UPSTREAM_TIMEOUT_MS: '500' },
+  });
+
+  const started = Date.now();
+  const outcome = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('client response hung')), 5000);
+    const req = http.request(
+      { host: '127.0.0.1', port: server.port, path: '/foo/bar.pdb/abc/foo.pdb' },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('aborted', () => {
+          clearTimeout(timer);
+          resolve({ statusCode: res.statusCode, body: Buffer.concat(chunks).toString() });
+        });
+        res.on('end', () => {
+          clearTimeout(timer);
+          reject(new Error('response ended cleanly; expected an aborted transfer'));
+        });
+      },
+    );
+    req.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    req.end();
+  });
+  const elapsed = Date.now() - started;
+
+  assert.equal(outcome.statusCode, 200);
+  assert.equal(outcome.body, 'partial');
+  assert.ok(
+    elapsed >= 400 && elapsed < 5000,
+    `expected the connection to be terminated at the ~500ms timeout, took ${elapsed}ms`,
+  );
 });
 
 test('asserts when TARGET_HOST is missing', async () => {
