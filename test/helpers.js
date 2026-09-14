@@ -77,7 +77,7 @@ function startUpstream(handler) {
   });
 }
 
-async function startSymbolServer({ targetHost, pathPrefix } = {}) {
+async function startSymbolServer({ targetHost, pathPrefix, extraEnv } = {}) {
   const port = await getFreePort();
 
   const env = {
@@ -88,6 +88,7 @@ async function startSymbolServer({ targetHost, pathPrefix } = {}) {
     // out-of-band way to trust the upstream's self-signed cert without
     // modifying the symbol-server source.
     NODE_EXTRA_CA_CERTS: path.join(__dirname, 'fixtures', 'test-cert.pem'),
+    ...extraEnv,
   };
   if (pathPrefix !== undefined) env.PATH_PREFIX = pathPrefix;
   else delete env.PATH_PREFIX;
@@ -134,14 +135,14 @@ async function startSymbolServer({ targetHost, pathPrefix } = {}) {
 
 // Spawn an upstream + symbol-server pair and register cleanup with the test
 // context. Returns { server, upstream }.
-async function startProxy(t, { handler, pathPrefix } = {}) {
+async function startProxy(t, { handler, pathPrefix, extraEnv } = {}) {
   const upstream = await startUpstream(handler || ((req, res) => {
     res.writeHead(200);
     res.end('ok');
   }));
   t.after(() => upstream.close());
 
-  const server = await startSymbolServer({ targetHost: upstream.host, pathPrefix });
+  const server = await startSymbolServer({ targetHost: upstream.host, pathPrefix, extraEnv });
   t.after(() => server.stop());
 
   return { server, upstream };

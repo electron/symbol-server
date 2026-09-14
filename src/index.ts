@@ -24,8 +24,25 @@ const TARGET_URL = url.format({
   host: TARGET_HOST,
 });
 
+// Abort upstream fetches whose socket goes quiet for this long. Without it, a
+// stalled upstream (connected but never responding, with no error event) hangs
+// the request until Heroku's 30-second router limit kills it (H12, surfaced to
+// the client as a 503). Timing out well under that limit lets our own error
+// handler answer promptly instead. This is an inactivity timeout on the
+// outgoing socket — flowing data resets it — so large symbol downloads that
+// take longer than this in total are unaffected.
+// An explicit UPSTREAM_TIMEOUT_MS=0 disables the timeout (http-proxy passes 0
+// through to socket.setTimeout, which clears it); only unset/invalid values
+// fall back to the default.
+const rawUpstreamTimeout = process.env.UPSTREAM_TIMEOUT_MS;
+const UPSTREAM_TIMEOUT_MS =
+  rawUpstreamTimeout !== undefined && rawUpstreamTimeout !== '' && !Number.isNaN(Number(rawUpstreamTimeout))
+    ? Number(rawUpstreamTimeout)
+    : 10_000;
+
 const proxy = httpProxy.createProxyServer({
   changeOrigin: true,
+  proxyTimeout: UPSTREAM_TIMEOUT_MS,
 });
 
 const APPS_TO_ALIAS = ['slack', 'notion', 'notion dev', 'claude', 'claude nest'];
@@ -114,6 +131,21 @@ proxy.on('proxyReq', (proxyReq, request, response, options) => {
   };
 });
 
+proxy.on('proxyRes', (proxyRes, req, res) => {
+  // If the upstream stalls (or drops) mid-body, the proxyTimeout abort lands
+  // here rather than in the 'error' handler: Node never emits 'error' on a
+  // ClientRequest once its response has started, it destroys the response
+  // instead. http-proxy pipes proxyRes into res without ending res on abort,
+  // so the client would otherwise hang on a truncated, unterminated body.
+  // Headers are already sent, so all we can do is terminate the connection.
+  proxyRes.on('aborted', () => {
+    // A client that disconnects first also aborts the upstream; nothing to do.
+    if (res.destroyed) return;
+    console.error('Upstream aborted mid-response. Request:', req.url);
+    res.destroy();
+  });
+});
+
 proxy.on('error', (err, req, res) => {
   const errorId = crypto.randomUUID();
 
@@ -122,10 +154,25 @@ proxy.on('error', (err, req, res) => {
   // The client may already be gone (disconnected mid-proxy) by the time the
   // upstream request fails; writing headers to a closed/finished response
   // would throw.
-  if (res.destroyed || res.writableEnded || res.headersSent) return;
+  if (res.destroyed || res.writableEnded) return;
+  // Headers already went out, so an error status can't follow. Terminate the
+  // connection so the client sees an aborted transfer instead of a hang.
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
 
-  res.writeHead(500, {
-    'Content-Type': 'text/plain'
+  // proxyTimeout aborts the upstream request, which surfaces here as
+  // ECONNRESET ("socket hang up"); ETIMEDOUT is a timed-out upstream connect.
+  // Both mean the upstream stalled, so answer 504 rather than a generic 500.
+  const code = (err as NodeJS.ErrnoException).code;
+  const status = code === 'ECONNRESET' || code === 'ETIMEDOUT' ? 504 : 500;
+
+  res.writeHead(status, {
+    'Content-Type': 'text/plain',
+    // Transient upstream failures must never be cached by Cloudflare, shared
+    // caches, or clients.
+    'Cache-Control': 'no-store'
   });
  
   res.end(`Something went wrong. If this happens consistently please report to https://github.com/electron/symbol-server with this error ID: "${errorId}"`);
