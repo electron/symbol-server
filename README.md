@@ -54,14 +54,39 @@ heroku config:add PATH_PREFIX=/awesome/symbols
 
 Now the symbol server URL can be `http://pepto-symbol.gadgetron.com`.
 
+### Configuration
+
+The server is a small Rust binary configured through environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TARGET_HOST` | (required) | Upstream host (and optional port) that symbols are fetched from over HTTPS. |
+| `PATH_PREFIX` | empty | Prepended to every upstream path. |
+| `PORT` | `8080` | Port to listen on. |
+| `UPSTREAM_TIMEOUT_MS` | `10000` | Abandon an upstream fetch that makes no progress for this long (504 before headers; aborted connection mid-body). `0` disables it. |
+| `UPSTREAM_POOL_MAX_IDLE` | `256` | Idle keep-alive connections kept open to the upstream for reuse. `0` opens a new connection per fetch. |
+| `EXTRA_CA_CERTS` | unset | PEM file of extra CA certificates to trust for the upstream (used by the tests). |
+| `TOKIO_WORKER_THREADS` | CPU count | Worker threads for the async runtime. |
+
 ### Running locally
 
-To run Pepto Symbol locally on port 5000:
+```shell
+TARGET_HOST=artifacts.electronjs.org PATH_PREFIX=/symbols cargo run --release
+```
+
+Run the checks CI runs with:
 
 ```shell
-echo S3_BUCKET=my-bucket > .env
-foreman start
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
+
+### Deploying to Heroku
+
+Production uses the [`emk/rust`](https://github.com/emk/heroku-buildpack-rust)
+buildpack, which reads `RustConfig` and runs the binary named in `Procfile`.
+Keep `VERSION` in `RustConfig` in sync with `rust-toolchain.toml`.
 
 ## Source
 
