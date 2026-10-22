@@ -30,7 +30,7 @@ patches:
       # No secrets (`secrets = {}` in infra), so no server-secrets Secret is
       # created; without this the pod would never start.
       - op: add
-        path: /spec/template/spec/containers/0/envFrom/0/optional
+        path: /spec/template/spec/containers/0/envFrom/0/secretRef/optional
         value: true
       - op: add
         path: /spec/template/spec/containers/0/env/-
