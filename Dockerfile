@@ -10,6 +10,8 @@ COPY src/ ./src/
 RUN cargo build --release --locked
 
 FROM alpine:3.22
+# tini: see ENTRYPOINT.
+RUN apk add --no-cache tini
 COPY --from=build /src/target/release/symbol-server /usr/local/bin/symbol-server
 
 # The cluster runs pods as uid/gid 1000 with a read-only root filesystem and a
@@ -20,4 +22,8 @@ ENV PORT=8080 \
     HOME=/tmp
 EXPOSE 8080
 # No HEALTHCHECK: Kubernetes probes /health (set in the prod overlay).
+# tini runs as PID 1 and forwards SIGTERM to the server, which has no SIGTERM
+# handler of its own; without it the kernel ignores the signal and every pod
+# waits out the 30s grace period before being SIGKILLed.
+ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["symbol-server"]
