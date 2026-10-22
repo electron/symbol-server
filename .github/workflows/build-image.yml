@@ -1,0 +1,33 @@
+# Copied from electron/ionic-kit's templates/build-image.yml.
+#
+# Pin `uses:` to a commit SHA of electron/ionic-kit and keep the tag in the
+# trailing comment; Dependabot and Renovate update both. Secrets are passed by
+# name, never with `secrets: inherit`, so the kit only ever sees these four.
+# Terraform writes all four to the repo when the app is added to electron/infra.
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write
+    uses: electron/ionic-kit/.github/workflows/deploy.yml@07503edb4d3ad6d77ffcee366840bbe91f7d4319 # main @ 2026-10-22
+    with:
+      app: symbol-server # ArgoCD Application name; must match the app's ionic-platform-apps entry in infra
+      argocd_server: ${{ vars.ARGOCD_SERVER }}
+      shared_vault: ${{ vars.IONIC_SHARED_VAULT }}
+    secrets:
+      AZURE_ACR_PUSH_CLIENT_ID: ${{ secrets.AZURE_ACR_PUSH_CLIENT_ID }}
+      IONIC_PLATFORM_AZURE_TENANT_ID: ${{ secrets.IONIC_PLATFORM_AZURE_TENANT_ID }}
+      IONIC_PLATFORM_AZURE_SUBSCRIPTION_ID: ${{ secrets.IONIC_PLATFORM_AZURE_SUBSCRIPTION_ID }}
+      ARGOCD_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
