@@ -12,11 +12,13 @@ patches:
       kind: HTTPRoute
       name: server
     patch: |-
-      # Temporary hostname while symbols.electronjs.org still points at
-      # Heroku. The cut-over adds symbols.electronjs.org here.
+      # symbol-server-next stays during the overlap with Heroku; drop it once
+      # symbols.electronjs.org traffic is confirmed on ionic.
       - op: replace
-        path: /spec/hostnames/0
-        value: symbol-server-next.electronjs.org
+        path: /spec/hostnames
+        value:
+          - symbols.electronjs.org
+          - symbol-server-next.electronjs.org
   - target:
       kind: Deployment
       name: server
