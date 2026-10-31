@@ -394,6 +394,7 @@ dependencies = [
  "hyper-util",
  "lru",
  "rustls",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "uuid",

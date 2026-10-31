@@ -561,3 +561,323 @@ async fn upstream_pool_max_idle_0_opens_a_connection_per_miss() {
     assert_eq!(upstream.request_count(), N);
     assert_eq!(upstream.connection_count(), N);
 }
+
+/// Upstream for the concurrency-cap tests. `/held/...` sends one chunk and
+/// then holds the body open forever; `/finite/...` sends two chunks 500ms
+/// apart and ends; `/endless/...` keeps sending chunks until the proxy goes
+/// away; `/big/...` is a BIG_BODY_LEN body sent in one go; `/missing/...`
+/// is a 404 and `/forbidden/...` a 403; anything else is a quick 200 "ok".
+async fn streaming_handler(req: hyper::Request<hyper::body::Incoming>) -> MockResponse {
+    let path = req.uri().path().to_owned();
+    let kind = path.split('/').nth(1).unwrap_or_default().to_owned();
+    if kind == "big" {
+        return hyper::Response::new(full(vec![b'x'; BIG_BODY_LEN]));
+    }
+    if kind == "missing" {
+        return respond(404, "not found");
+    }
+    if kind == "forbidden" {
+        return respond(403, "");
+    }
+    if !matches!(kind.as_str(), "held" | "finite" | "endless") {
+        return respond(200, "ok");
+    }
+    let (mut tx, body) = channel_body();
+    tokio::spawn(async move {
+        match kind.as_str() {
+            "held" => {
+                let _ = tx.send_data(Bytes::from_static(b"partial")).await;
+                std::future::pending::<()>().await;
+            }
+            "finite" => {
+                let _ = tx.send_data(Bytes::from_static(b"one")).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = tx.send_data(Bytes::from_static(b"two")).await;
+            }
+            _ => loop {
+                if tx
+                    .send_data(Bytes::from(vec![b'x'; 16 * 1024]))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            },
+        }
+    });
+    hyper::Response::new(body)
+}
+
+const BIG_BODY_LEN: usize = 256 * 1024;
+
+/// A raw client connection with a small receive buffer, so the proxy's
+/// writes to it block quickly once it stops reading.
+async fn small_buffer_client(port: u16, path: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut client = socket.connect(([127, 0, 0, 1], port).into()).await.unwrap();
+    client
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    client
+}
+
+fn assert_busy(res: &TestResponse) {
+    assert_eq!(res.status, 503, "expected a 503, got body {:?}", res.body);
+    assert_eq!(res.header("retry-after"), Some("5"));
+    assert_eq!(res.header("cache-control"), Some("no-store"));
+}
+
+/// New: with MAX_INFLIGHT_UPSTREAM=N and N 200 bodies still streaming, a
+/// further 200 from the upstream is dropped and the client gets an
+/// uncacheable 503 + Retry-After, and a burst of rejections logs a single
+/// warning.
+#[tokio::test]
+async fn requests_beyond_max_inflight_upstream_get_503() {
+    const N: usize = 3;
+    let (server, upstream) =
+        start_proxy(streaming_handler, None, &[("MAX_INFLIGHT_UPSTREAM", "3")]).await;
+
+    let mut held = Vec::new();
+    for i in 0..N {
+        let res = send(server.port, &format!("/held/{i}/abc/file.pdb"), &[]).await;
+        assert_eq!(res.status(), 200);
+        held.push(res);
+    }
+
+    for i in 0..3 {
+        let res = request(server.port, &format!("/fast/{i}/abc/file.pdb"), &[]).await;
+        assert_busy(&res);
+        assert_eq!(res.header("access-control-allow-origin"), Some("*"));
+    }
+    // The permit is only taken once the upstream has answered 2xx.
+    assert_eq!(upstream.request_count(), N + 3);
+
+    // Give the stderr reader thread a moment to catch up.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stderr = server.stderr();
+    assert_eq!(
+        stderr.matches("upstream slots busy").count(),
+        1,
+        "expected one rate-limited warning, got:\n{stderr}"
+    );
+    assert!(stderr.contains("all 3 upstream slots busy"), "{stderr}");
+    drop(held);
+}
+
+/// New: /health and the redirect branch never take an upstream slot, so the
+/// probes and symbolicator keep working while the cap is saturated.
+#[tokio::test]
+async fn health_and_redirects_answer_while_max_inflight_upstream_is_saturated() {
+    let (server, upstream) =
+        start_proxy(streaming_handler, None, &[("MAX_INFLIGHT_UPSTREAM", "1")]).await;
+
+    let held = send(server.port, "/held/0/abc/file.pdb", &[]).await;
+    assert_eq!(held.status(), 200);
+    assert_busy(&request(server.port, "/fast/0/abc/file.pdb", &[]).await);
+
+    let health = request(server.port, "/health", &[]).await;
+    assert_eq!(health.status, 200);
+    assert_eq!(health.body, "Alive");
+
+    let redirect = request(
+        server.port,
+        "/Foo/Bar",
+        &[("user-agent", "symbolicator/1.2.3")],
+    )
+    .await;
+    assert_eq!(redirect.status, 302);
+    // The held stream and the shed /fast/ request; nothing for /health or
+    // the redirect.
+    assert_eq!(upstream.request_count(), 2);
+    drop(held);
+}
+
+/// New: misses and errors never count against MAX_INFLIGHT_UPSTREAM, so a
+/// burst of parallel lookups for missing symbols still gets its 404s while
+/// the cap is saturated by downloads.
+#[tokio::test]
+async fn non_2xx_responses_pass_through_while_max_inflight_upstream_is_saturated() {
+    let (server, upstream) =
+        start_proxy(streaming_handler, None, &[("MAX_INFLIGHT_UPSTREAM", "1")]).await;
+
+    let held = send(server.port, "/held/0/abc/file.pdb", &[]).await;
+    assert_eq!(held.status(), 200);
+    assert_busy(&request(server.port, "/fast/0/abc/file.pdb", &[]).await);
+
+    for i in 0..5 {
+        let res = request(server.port, &format!("/missing/{i}/abc/file.pdb"), &[]).await;
+        assert_eq!(res.status, 404);
+        assert_eq!(res.body, "not found");
+    }
+    // An upstream 403 is still turned into a negative-cached 404.
+    let res = request(server.port, "/forbidden/0/abc/file.pdb", &[]).await;
+    assert_eq!(res.status, 404);
+    assert_eq!(res.header("cache-control"), Some(MISSING_CACHE_CONTROL));
+    assert_eq!(upstream.request_count(), 8);
+    drop(held);
+}
+
+/// New: the upstream slot is held until the body has finished streaming, and
+/// released once it has.
+#[tokio::test]
+async fn upstream_slot_is_released_when_the_body_completes() {
+    let (server, _upstream) =
+        start_proxy(streaming_handler, None, &[("MAX_INFLIGHT_UPSTREAM", "1")]).await;
+
+    let first = send(server.port, "/finite/0/abc/file.pdb", &[]).await;
+    assert_eq!(first.status(), 200);
+    // Headers are out but the body is still streaming: the slot is taken.
+    assert_busy(&request(server.port, "/fast/0/abc/file.pdb", &[]).await);
+
+    let (body, end) = read_body(first.into_body()).await;
+    assert!(matches!(end, BodyEnd::Complete));
+    assert_eq!(body, "onetwo");
+
+    let res = request(server.port, "/fast/1/abc/file.pdb", &[]).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, "ok");
+}
+
+/// New: a client that disconnects mid-body releases its upstream slot (the
+/// incident's shape: a client abandoning a large download partway through).
+#[tokio::test]
+async fn upstream_slot_is_released_when_the_client_disconnects_mid_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (server, _upstream) =
+        start_proxy(streaming_handler, None, &[("MAX_INFLIGHT_UPSTREAM", "1")]).await;
+
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
+    client
+        .write_all(b"GET /endless/0/abc/file.pdb HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut received = Vec::new();
+    while received.len() < 32 * 1024 {
+        let n = client.read(&mut buf).await.unwrap();
+        assert!(n > 0, "server closed the connection early");
+        received.extend_from_slice(&buf[..n]);
+    }
+    assert!(received.starts_with(b"HTTP/1.1 200"));
+    assert_busy(&request(server.port, "/fast/0/abc/file.pdb", &[]).await);
+
+    // Hang up with the body still flowing.
+    drop(client);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let res = request(server.port, "/fast/1/abc/file.pdb", &[]).await;
+        if res.status == 200 {
+            assert_eq!(res.body, "ok");
+            break;
+        }
+        assert_busy(&res);
+        assert!(
+            Instant::now() < deadline,
+            "upstream slot was not released after the client disconnected"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// New: a client that reads the headers and then stops reading, without
+/// disconnecting, loses its upstream slot once writes to it have been
+/// blocked for CLIENT_WRITE_TIMEOUT_MS. hyper stops polling the body while
+/// the write is blocked, so nothing else would ever release it.
+#[tokio::test]
+async fn upstream_slot_is_released_when_the_client_stops_reading() {
+    use tokio::io::AsyncReadExt;
+
+    let (server, _upstream) = start_proxy(
+        streaming_handler,
+        None,
+        &[
+            ("MAX_INFLIGHT_UPSTREAM", "1"),
+            ("CLIENT_SEND_BUFFER_BYTES", "4096"),
+            ("CLIENT_WRITE_TIMEOUT_MS", "500"),
+        ],
+    )
+    .await;
+
+    let mut client = small_buffer_client(server.port, "/endless/0/abc/file.pdb").await;
+    let mut head = [0u8; 12];
+    client.read_exact(&mut head).await.unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200");
+    // From here on the client never reads again but keeps the connection
+    // open, so the proxy's writes to it soon block for good.
+    assert_busy(&request(server.port, "/fast/0/abc/file.pdb", &[]).await);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let res = request(server.port, "/fast/1/abc/file.pdb", &[]).await;
+        if res.status == 200 {
+            assert_eq!(res.body, "ok");
+            break;
+        }
+        assert_busy(&res);
+        assert!(
+            Instant::now() < deadline,
+            "upstream slot was not released after the client stopped reading"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(client);
+}
+
+/// New: the write timeout restarts on every completed write rather than
+/// bounding the whole download, so a client that keeps reading comfortably
+/// above the minimum drain rate (about a third of the doubled 4 KiB send
+/// buffer per 300ms here) gets the whole body even though the download
+/// takes several times CLIENT_WRITE_TIMEOUT_MS. Clients below that rate
+/// are dropped; this test doesn't cover them.
+#[tokio::test]
+async fn a_client_reading_above_the_minimum_rate_outlasts_the_write_timeout() {
+    use tokio::io::AsyncReadExt;
+
+    let (server, _upstream) = start_proxy(
+        streaming_handler,
+        None,
+        &[
+            ("CLIENT_SEND_BUFFER_BYTES", "4096"),
+            ("CLIENT_WRITE_TIMEOUT_MS", "300"),
+        ],
+    )
+    .await;
+
+    let started = Instant::now();
+    let mut client = small_buffer_client(server.port, "/big/0/abc/file.pdb").await;
+    let mut received = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = client.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        received.extend_from_slice(&buf[..n]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let elapsed = started.elapsed();
+
+    let head_end = received
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("no response head")
+        + 4;
+    assert!(received.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(received.len() - head_end, BIG_BODY_LEN, "body was cut off");
+    assert!(
+        elapsed > Duration::from_millis(600),
+        "the download was too fast to exercise the timeout ({elapsed:?})"
+    );
+}

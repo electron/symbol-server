@@ -7,6 +7,7 @@ pub mod config;
 pub mod negative_cache;
 pub mod proxy;
 pub mod rewrite;
+pub mod write_timeout;
 
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -38,6 +39,14 @@ pub async fn run(config: Config) -> Result<(), String> {
             }
         };
         let _ = stream.set_nodelay(true);
+        if let Some(size) = config.client_send_buffer {
+            // Caps the kernel memory a slow or stalled client can pin while
+            // a large body streams to it (see CLIENT_SEND_BUFFER_BYTES).
+            let _ = socket2::SockRef::from(&stream).set_send_buffer_size(size);
+        }
+        // Without this, a client that stops reading mid-body would hold its
+        // upstream slot for as long as it keeps the connection open.
+        let stream = write_timeout::WriteTimeout::new(stream, config.client_write_timeout);
         let app = app.clone();
         tokio::spawn(async move {
             let service = service_fn(move |req| app.clone().handle(req));
