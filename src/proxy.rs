@@ -161,7 +161,8 @@ impl App {
     async fn proxy(&self, req: Request<Incoming>, target: String) -> Response<ResponseBody> {
         // Taken before contacting the upstream and moved into the response
         // body below, so it is released when the body finishes, fails, or
-        // is dropped because the client disconnected. Every early return
+        // is dropped because the client disconnected or stopped reading for
+        // CLIENT_WRITE_TIMEOUT_MS (see write_timeout.rs). Every early return
         // drops it with this frame.
         let slot = self.upstream_slots.clone().acquire_owned();
         let Ok(Ok(permit)) = tokio::time::timeout(UPSTREAM_SLOT_WAIT, slot).await else {
@@ -507,7 +508,10 @@ pub struct UpstreamBody {
     idle: Option<Pin<Box<Sleep>>>,
     target: String,
     /// This stream's upstream slot. Released as soon as the body ends or
-    /// fails, and otherwise when hyper drops the body (client disconnect).
+    /// fails, and otherwise when hyper drops the body: the client
+    /// disconnected, or stopped reading and hit CLIENT_WRITE_TIMEOUT_MS.
+    /// The idle timer above can't catch a stalled client, because hyper
+    /// stops polling the body while its writes are blocked.
     permit: Option<OwnedSemaphorePermit>,
 }
 

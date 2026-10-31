@@ -28,6 +28,11 @@ pub const DEFAULT_MAX_INFLIGHT_UPSTREAM: usize = 64;
 /// instead of growing to the multi-megabyte `tcp_rmem`/`tcp_wmem` maximums.
 pub const DEFAULT_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 
+/// Used when `CLIENT_WRITE_TIMEOUT_MS` is unset or empty. Only time spent
+/// with a write to the client completely blocked counts, so this never cuts
+/// off a slow client that is still reading.
+pub const DEFAULT_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// `PORT`: the port to listen on (all IPv4 interfaces).
@@ -58,6 +63,10 @@ pub struct Config {
     /// connections. `None` (an explicit `0`) leaves it to the kernel's
     /// autotuning.
     pub client_send_buffer: Option<usize>,
+    /// `CLIENT_WRITE_TIMEOUT_MS`: how long a write to a client may make no
+    /// progress before the connection (and the upstream slot its response
+    /// holds) is dropped. `None` (an explicit `0`) disables it.
+    pub client_write_timeout: Option<Duration>,
 }
 
 impl Config {
@@ -102,6 +111,19 @@ impl Config {
             },
         };
 
+        let client_write_timeout = match non_empty("CLIENT_WRITE_TIMEOUT_MS") {
+            None => Some(DEFAULT_CLIENT_WRITE_TIMEOUT),
+            Some(v) => match v.trim().parse() {
+                Ok(0) => None,
+                Ok(ms) => Some(Duration::from_millis(ms)),
+                Err(_) => {
+                    return Err(format!(
+                        "CLIENT_WRITE_TIMEOUT_MS {v:?} is not a non-negative integer"
+                    ));
+                }
+            },
+        };
+
         Ok(Self {
             port,
             target_host,
@@ -112,6 +134,7 @@ impl Config {
             max_inflight_upstream,
             upstream_recv_buffer: socket_buffer(&non_empty, "UPSTREAM_RECV_BUFFER_BYTES")?,
             client_send_buffer: socket_buffer(&non_empty, "CLIENT_SEND_BUFFER_BYTES")?,
+            client_write_timeout,
         })
     }
 }
@@ -259,6 +282,7 @@ mod tests {
                 max_inflight_upstream: DEFAULT_MAX_INFLIGHT_UPSTREAM,
                 upstream_recv_buffer: Some(DEFAULT_SOCKET_BUFFER_BYTES),
                 client_send_buffer: Some(DEFAULT_SOCKET_BUFFER_BYTES),
+                client_write_timeout: Some(DEFAULT_CLIENT_WRITE_TIMEOUT),
             }
         );
         // PORT="" falls back like `process.env.PORT || 8080`.
@@ -278,6 +302,7 @@ mod tests {
             ("MAX_INFLIGHT_UPSTREAM", "8"),
             ("UPSTREAM_RECV_BUFFER_BYTES", "65536"),
             ("CLIENT_SEND_BUFFER_BYTES", "0"),
+            ("CLIENT_WRITE_TIMEOUT_MS", "1500"),
         ])
         .unwrap();
         assert_eq!(c.port, 5000);
@@ -289,6 +314,9 @@ mod tests {
         assert_eq!(c.max_inflight_upstream, 8);
         assert_eq!(c.upstream_recv_buffer, Some(65536));
         assert_eq!(c.client_send_buffer, None);
+        assert_eq!(c.client_write_timeout, Some(Duration::from_millis(1500)));
+        let c = config(&[("TARGET_HOST", "h"), ("CLIENT_WRITE_TIMEOUT_MS", "0")]).unwrap();
+        assert_eq!(c.client_write_timeout, None);
     }
 
     #[test]
@@ -309,5 +337,6 @@ mod tests {
         assert!(config(&[("TARGET_HOST", "h"), ("MAX_INFLIGHT_UPSTREAM", "-1")]).is_err());
         assert!(config(&[("TARGET_HOST", "h"), ("UPSTREAM_RECV_BUFFER_BYTES", "1k")]).is_err());
         assert!(config(&[("TARGET_HOST", "h"), ("CLIENT_SEND_BUFFER_BYTES", "x")]).is_err());
+        assert!(config(&[("TARGET_HOST", "h"), ("CLIENT_WRITE_TIMEOUT_MS", "30s")]).is_err());
     }
 }

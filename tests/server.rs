@@ -565,10 +565,14 @@ async fn upstream_pool_max_idle_0_opens_a_connection_per_miss() {
 /// Upstream for the concurrency-cap tests. `/held/...` sends one chunk and
 /// then holds the body open forever; `/finite/...` sends two chunks 500ms
 /// apart and ends; `/endless/...` keeps sending chunks until the proxy goes
-/// away; anything else is a quick 200 "ok".
+/// away; `/big/...` is a BIG_BODY_LEN body sent in one go; anything else is
+/// a quick 200 "ok".
 async fn streaming_handler(req: hyper::Request<hyper::body::Incoming>) -> MockResponse {
     let path = req.uri().path().to_owned();
     let kind = path.split('/').nth(1).unwrap_or_default().to_owned();
+    if kind == "big" {
+        return hyper::Response::new(full(vec![b'x'; BIG_BODY_LEN]));
+    }
     if !matches!(kind.as_str(), "held" | "finite" | "endless") {
         return respond(200, "ok");
     }
@@ -597,6 +601,26 @@ async fn streaming_handler(req: hyper::Request<hyper::body::Incoming>) -> MockRe
         }
     });
     hyper::Response::new(body)
+}
+
+const BIG_BODY_LEN: usize = 256 * 1024;
+
+/// A raw client connection with a small receive buffer, so the proxy's
+/// writes to it block quickly once it stops reading.
+async fn small_buffer_client(port: u16, path: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut client = socket.connect(([127, 0, 0, 1], port).into()).await.unwrap();
+    client
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    client
 }
 
 fn assert_busy(res: &TestResponse) {
@@ -730,4 +754,92 @@ async fn upstream_slot_is_released_when_the_client_disconnects_mid_body() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// New: a client that reads the headers and then stops reading, without
+/// disconnecting, loses its upstream slot once writes to it have been
+/// blocked for CLIENT_WRITE_TIMEOUT_MS. hyper stops polling the body while
+/// the write is blocked, so nothing else would ever release it.
+#[tokio::test]
+async fn upstream_slot_is_released_when_the_client_stops_reading() {
+    use tokio::io::AsyncReadExt;
+
+    let (server, _upstream) = start_proxy(
+        streaming_handler,
+        None,
+        &[
+            ("MAX_INFLIGHT_UPSTREAM", "1"),
+            ("CLIENT_SEND_BUFFER_BYTES", "4096"),
+            ("CLIENT_WRITE_TIMEOUT_MS", "500"),
+        ],
+    )
+    .await;
+
+    let mut client = small_buffer_client(server.port, "/endless/0/abc/file.pdb").await;
+    let mut head = [0u8; 12];
+    client.read_exact(&mut head).await.unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200");
+    // From here on the client never reads again but keeps the connection
+    // open, so the proxy's writes to it soon block for good.
+    assert_busy(&request(server.port, "/fast/0/abc/file.pdb", &[]).await);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let res = request(server.port, "/fast/1/abc/file.pdb", &[]).await;
+        if res.status == 200 {
+            assert_eq!(res.body, "ok");
+            break;
+        }
+        assert_busy(&res);
+        assert!(
+            Instant::now() < deadline,
+            "upstream slot was not released after the client stopped reading"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(client);
+}
+
+/// New: the write timeout only counts time with no progress at all, so a
+/// client that reads slowly but steadily gets the whole body even though
+/// the download takes several times CLIENT_WRITE_TIMEOUT_MS.
+#[tokio::test]
+async fn a_slow_but_steady_client_is_not_cut_off_by_the_write_timeout() {
+    use tokio::io::AsyncReadExt;
+
+    let (server, _upstream) = start_proxy(
+        streaming_handler,
+        None,
+        &[
+            ("CLIENT_SEND_BUFFER_BYTES", "4096"),
+            ("CLIENT_WRITE_TIMEOUT_MS", "300"),
+        ],
+    )
+    .await;
+
+    let started = Instant::now();
+    let mut client = small_buffer_client(server.port, "/big/0/abc/file.pdb").await;
+    let mut received = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = client.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        received.extend_from_slice(&buf[..n]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let elapsed = started.elapsed();
+
+    let head_end = received
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("no response head")
+        + 4;
+    assert!(received.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(received.len() - head_end, BIG_BODY_LEN, "body was cut off");
+    assert!(
+        elapsed > Duration::from_millis(600),
+        "the download was too fast to exercise the timeout ({elapsed:?})"
+    );
 }

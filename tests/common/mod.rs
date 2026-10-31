@@ -224,6 +224,7 @@ pub async fn start_symbol_server(opts: ServerOptions<'_>) -> Result<SymbolServer
         "MAX_INFLIGHT_UPSTREAM",
         "UPSTREAM_RECV_BUFFER_BYTES",
         "CLIENT_SEND_BUFFER_BYTES",
+        "CLIENT_WRITE_TIMEOUT_MS",
     ] {
         cmd.env_remove(var);
     }

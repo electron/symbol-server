@@ -65,9 +65,10 @@ The server is a small Rust binary configured through environment variables:
 | `PORT` | `8080` | Port to listen on. |
 | `UPSTREAM_TIMEOUT_MS` | `10000` | Abandon an upstream fetch that makes no progress for this long (504 before headers; aborted connection mid-body). `0` disables it. |
 | `UPSTREAM_POOL_MAX_IDLE` | `256` | Idle keep-alive connections kept open to the upstream for reuse. `0` opens a new connection per fetch. |
-| `MAX_INFLIGHT_UPSTREAM` | `64` | Upstream fetches (including their streaming bodies) allowed in flight at once. Further requests wait up to 100ms for a slot, then get an uncacheable `503` with `Retry-After: 5`. `/health`, redirects and negative-cache hits never take a slot. `0` means the default. |
+| `MAX_INFLIGHT_UPSTREAM` | `64` | Upstream fetches (including their streaming bodies) allowed in flight at once. Further requests wait up to 100ms for a slot, then get an uncacheable `503` with `Retry-After: 5`. `/health`, redirects and negative-cache hits never take a slot. A slot is held until the response body ends, fails, or the client disconnects or hits `CLIENT_WRITE_TIMEOUT_MS`. `0` means the default. |
 | `UPSTREAM_RECV_BUFFER_BYTES` | `262144` | `SO_RCVBUF` for upstream connections (Linux doubles it and disables autotuning). `0` leaves it to the kernel. |
 | `CLIENT_SEND_BUFFER_BYTES` | `262144` | `SO_SNDBUF` for accepted client connections (Linux doubles it and disables autotuning). `0` leaves it to the kernel. |
+| `CLIENT_WRITE_TIMEOUT_MS` | `30000` | Drop a client connection (and release its upstream slot) once a write to it has made no progress for this long, e.g. a client that stopped reading mid-download without disconnecting. Slow clients that keep reading are never cut off. `0` disables it. |
 | `EXTRA_CA_CERTS` | unset | PEM file of extra CA certificates to trust for the upstream (used by the tests). |
 | `TOKIO_WORKER_THREADS` | CPU count | Worker threads for the async runtime. |
 
