@@ -565,13 +565,19 @@ async fn upstream_pool_max_idle_0_opens_a_connection_per_miss() {
 /// Upstream for the concurrency-cap tests. `/held/...` sends one chunk and
 /// then holds the body open forever; `/finite/...` sends two chunks 500ms
 /// apart and ends; `/endless/...` keeps sending chunks until the proxy goes
-/// away; `/big/...` is a BIG_BODY_LEN body sent in one go; anything else is
-/// a quick 200 "ok".
+/// away; `/big/...` is a BIG_BODY_LEN body sent in one go; `/missing/...`
+/// is a 404 and `/forbidden/...` a 403; anything else is a quick 200 "ok".
 async fn streaming_handler(req: hyper::Request<hyper::body::Incoming>) -> MockResponse {
     let path = req.uri().path().to_owned();
     let kind = path.split('/').nth(1).unwrap_or_default().to_owned();
     if kind == "big" {
         return hyper::Response::new(full(vec![b'x'; BIG_BODY_LEN]));
+    }
+    if kind == "missing" {
+        return respond(404, "not found");
+    }
+    if kind == "forbidden" {
+        return respond(403, "");
     }
     if !matches!(kind.as_str(), "held" | "finite" | "endless") {
         return respond(200, "ok");
@@ -629,9 +635,10 @@ fn assert_busy(res: &TestResponse) {
     assert_eq!(res.header("cache-control"), Some("no-store"));
 }
 
-/// New: with MAX_INFLIGHT_UPSTREAM=N and N response bodies still streaming,
-/// further requests are shed with an uncacheable 503 + Retry-After without
-/// reaching the upstream, and a burst of rejections logs a single warning.
+/// New: with MAX_INFLIGHT_UPSTREAM=N and N 200 bodies still streaming, a
+/// further 200 from the upstream is dropped and the client gets an
+/// uncacheable 503 + Retry-After, and a burst of rejections logs a single
+/// warning.
 #[tokio::test]
 async fn requests_beyond_max_inflight_upstream_get_503() {
     const N: usize = 3;
@@ -650,7 +657,8 @@ async fn requests_beyond_max_inflight_upstream_get_503() {
         assert_busy(&res);
         assert_eq!(res.header("access-control-allow-origin"), Some("*"));
     }
-    assert_eq!(upstream.request_count(), N);
+    // The permit is only taken once the upstream has answered 2xx.
+    assert_eq!(upstream.request_count(), N + 3);
 
     // Give the stderr reader thread a moment to catch up.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -686,7 +694,34 @@ async fn health_and_redirects_answer_while_max_inflight_upstream_is_saturated() 
     )
     .await;
     assert_eq!(redirect.status, 302);
-    assert_eq!(upstream.request_count(), 1);
+    // The held stream and the shed /fast/ request; nothing for /health or
+    // the redirect.
+    assert_eq!(upstream.request_count(), 2);
+    drop(held);
+}
+
+/// New: misses and errors never count against MAX_INFLIGHT_UPSTREAM, so a
+/// burst of parallel lookups for missing symbols still gets its 404s while
+/// the cap is saturated by downloads.
+#[tokio::test]
+async fn non_2xx_responses_pass_through_while_max_inflight_upstream_is_saturated() {
+    let (server, upstream) =
+        start_proxy(streaming_handler, None, &[("MAX_INFLIGHT_UPSTREAM", "1")]).await;
+
+    let held = send(server.port, "/held/0/abc/file.pdb", &[]).await;
+    assert_eq!(held.status(), 200);
+    assert_busy(&request(server.port, "/fast/0/abc/file.pdb", &[]).await);
+
+    for i in 0..5 {
+        let res = request(server.port, &format!("/missing/{i}/abc/file.pdb"), &[]).await;
+        assert_eq!(res.status, 404);
+        assert_eq!(res.body, "not found");
+    }
+    // An upstream 403 is still turned into a negative-cached 404.
+    let res = request(server.port, "/forbidden/0/abc/file.pdb", &[]).await;
+    assert_eq!(res.status, 404);
+    assert_eq!(res.header("cache-control"), Some(MISSING_CACHE_CONTROL));
+    assert_eq!(upstream.request_count(), 8);
     drop(held);
 }
 

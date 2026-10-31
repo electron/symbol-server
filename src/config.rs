@@ -15,11 +15,11 @@ pub const DEFAULT_POOL_MAX_IDLE: usize = 256;
 pub const DEFAULT_PORT: u16 = 8080;
 
 /// Used when `MAX_INFLIGHT_UPSTREAM` is unset, empty, or `0`. Each in-flight
-/// upstream fetch pins an upstream socket and a client socket for as long as
-/// the body streams; with the socket buffers capped below that is roughly
-/// 2-3 MiB of kernel and user-space buffers per stream at worst, so 64 of
-/// them fit comfortably in a 512Mi pod alongside the ~75 MB baseline, while
-/// still allowing a couple of thousand short misses per second per pod.
+/// 2xx response stream pins an upstream socket and a client socket for as
+/// long as the body streams; with the socket buffers capped below that is
+/// roughly 2-3 MiB of kernel and user-space buffers per stream at worst, so
+/// 64 of them fit comfortably in a 512Mi pod alongside the ~75 MB baseline.
+/// Misses and errors don't count against it.
 pub const DEFAULT_MAX_INFLIGHT_UPSTREAM: usize = 64;
 
 /// Used for `UPSTREAM_RECV_BUFFER_BYTES` and `CLIENT_SEND_BUFFER_BYTES` when
@@ -54,9 +54,10 @@ pub struct Config {
     /// for the upstream, in addition to the bundled Mozilla roots. The Rust
     /// counterpart of `NODE_EXTRA_CA_CERTS`; used by the tests.
     pub extra_ca_certs: Option<PathBuf>,
-    /// `MAX_INFLIGHT_UPSTREAM`: how many upstream fetches (including their
-    /// streaming bodies) may be in flight at once. Requests beyond that get
-    /// a 503. Unset, empty, or `0` means [`DEFAULT_MAX_INFLIGHT_UPSTREAM`].
+    /// `MAX_INFLIGHT_UPSTREAM`: how many 2xx upstream response bodies may be
+    /// streaming at once. Further 2xx responses are dropped for a 503;
+    /// non-2xx responses pass through uncounted. Unset, empty, or `0` means
+    /// [`DEFAULT_MAX_INFLIGHT_UPSTREAM`].
     pub max_inflight_upstream: usize,
     /// `UPSTREAM_RECV_BUFFER_BYTES`: `SO_RCVBUF` for upstream connections.
     /// `None` (an explicit `0`) leaves it to the kernel's autotuning.

@@ -39,9 +39,10 @@ pub const HIT_CACHE_CONTROL: &str = "public, max-age=604800, immutable";
 /// reuse a connection the upstream is about to close.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a request waits for an upstream slot before getting a 503. Long
-/// enough to absorb a burst of short misses, short enough that a flood of
-/// rejected requests doesn't pile up waiting.
+/// How long a 2xx response waits for an upstream slot before being dropped
+/// for a 503. Long enough to ride out a download finishing just as another
+/// starts, short enough that a flood of rejected requests doesn't pile up
+/// holding upstream responses.
 const UPSTREAM_SLOT_WAIT: Duration = Duration::from_millis(100);
 /// `Retry-After` (seconds) on the 503 sent when every upstream slot is busy.
 const BUSY_RETRY_AFTER: &str = "5";
@@ -76,8 +77,9 @@ pub struct App {
     rewriter: PathRewriter,
     missing: NegativeCache,
     upstream_timeout: Option<Duration>,
-    /// One permit per in-flight upstream fetch, held until its response
-    /// body has finished streaming (or the client goes away).
+    /// One permit per in-flight 2xx response stream, held until the body
+    /// has finished streaming (or the client goes away). Non-2xx responses
+    /// (404s, 403s turned into 404s, errors) never take one.
     upstream_slots: Arc<Semaphore>,
     max_inflight_upstream: usize,
     busy_rejections: AtomicU64,
@@ -159,16 +161,6 @@ impl App {
     }
 
     async fn proxy(&self, req: Request<Incoming>, target: String) -> Response<ResponseBody> {
-        // Taken before contacting the upstream and moved into the response
-        // body below, so it is released when the body finishes, fails, or
-        // is dropped because the client disconnected or stopped reading for
-        // CLIENT_WRITE_TIMEOUT_MS (see write_timeout.rs). Every early return
-        // drops it with this frame.
-        let slot = self.upstream_slots.clone().acquire_owned();
-        let Ok(Ok(permit)) = tokio::time::timeout(UPSTREAM_SLOT_WAIT, slot).await else {
-            return self.busy_response(&target);
-        };
-
         let upstream_path = self.rewriter.rewrite(&rewrite::legacy_proxy_path(&target));
         let uri = match Uri::builder()
             .scheme("https")
@@ -208,6 +200,25 @@ impl App {
             }
         };
 
+        // Only 2xx bodies (the symbol files themselves, some hundreds of MB)
+        // count against the cap; misses and errors are small and pass
+        // through, so a burst of parallel lookups never turns 404s into
+        // 503s. The permit moves into the response body below, so it is
+        // released when the body finishes, fails, or is dropped because the
+        // client disconnected or stopped reading for CLIENT_WRITE_TIMEOUT_MS
+        // (see write_timeout.rs). On a 503, dropping `upstream_res` drops
+        // its unread body, so hyper closes that upstream connection rather
+        // than returning it to the pool.
+        let permit = if upstream_res.status().is_success() {
+            let slot = self.upstream_slots.clone().acquire_owned();
+            match tokio::time::timeout(UPSTREAM_SLOT_WAIT, slot).await {
+                Ok(Ok(permit)) => Some(permit),
+                _ => return self.busy_response(&target),
+            }
+        } else {
+            None
+        };
+
         let (mut parts, body) = upstream_res.into_parts();
         strip_hop_by_hop(&mut parts.headers);
         // Upstream values win, as they did when http-proxy copied the
@@ -235,9 +246,9 @@ impl App {
         Response::from_parts(parts, ResponseBody::Upstream(body))
     }
 
-    /// Every upstream slot is taken: shed the request instead of opening yet
-    /// another upstream stream, so a download flood can't push the pod past
-    /// its memory limit.
+    /// Every upstream slot is taken: shed the request instead of streaming
+    /// yet another body, so a download flood can't push the pod past its
+    /// memory limit.
     fn busy_response(&self, target: &str) -> Response<ResponseBody> {
         self.busy_rejections.fetch_add(1, Ordering::Relaxed);
         {
@@ -507,7 +518,8 @@ pub struct UpstreamBody {
     timeout: Option<Duration>,
     idle: Option<Pin<Box<Sleep>>>,
     target: String,
-    /// This stream's upstream slot. Released as soon as the body ends or
+    /// This stream's upstream slot (`None` for non-2xx responses, which
+    /// don't count against the cap). Released as soon as the body ends or
     /// fails, and otherwise when hyper drops the body: the client
     /// disconnected, or stopped reading and hit CLIENT_WRITE_TIMEOUT_MS.
     /// The idle timer above can't catch a stalled client, because hyper
@@ -520,14 +532,14 @@ impl UpstreamBody {
         inner: Incoming,
         timeout: Option<Duration>,
         target: String,
-        permit: OwnedSemaphorePermit,
+        permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         Self {
             inner,
             timeout,
             idle: timeout.map(|t| Box::pin(tokio::time::sleep(t))),
             target,
-            permit: Some(permit),
+            permit,
         }
     }
 }
