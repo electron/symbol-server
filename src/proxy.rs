@@ -18,9 +18,11 @@ use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, Sleep};
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
@@ -36,6 +38,15 @@ pub const HIT_CACHE_CONTROL: &str = "public, max-age=604800, immutable";
 /// stay under typical server-side keep-alive timeouts, so we rarely try to
 /// reuse a connection the upstream is about to close.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a request waits for an upstream slot before getting a 503. Long
+/// enough to absorb a burst of short misses, short enough that a flood of
+/// rejected requests doesn't pile up waiting.
+const UPSTREAM_SLOT_WAIT: Duration = Duration::from_millis(100);
+/// `Retry-After` (seconds) on the 503 sent when every upstream slot is busy.
+const BUSY_RETRY_AFTER: &str = "5";
+/// At most one "upstream slots exhausted" warning per interval.
+const BUSY_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 const CLOUDFLARE_CDN_CACHE_CONTROL: HeaderName =
     HeaderName::from_static("cloudflare-cdn-cache-control");
@@ -65,12 +76,19 @@ pub struct App {
     rewriter: PathRewriter,
     missing: NegativeCache,
     upstream_timeout: Option<Duration>,
+    /// One permit per in-flight upstream fetch, held until its response
+    /// body has finished streaming (or the client goes away).
+    upstream_slots: Arc<Semaphore>,
+    max_inflight_upstream: usize,
+    busy_rejections: AtomicU64,
+    busy_last_warn: Mutex<Option<Instant>>,
 }
 
 impl App {
     pub fn new(config: &Config) -> Result<Self, String> {
         let target_host_header = HeaderValue::from_str(&config.target_host)
             .map_err(|e| format!("TARGET_HOST is not a valid Host header: {e}"))?;
+        let max_inflight_upstream = config.max_inflight_upstream.min(Semaphore::MAX_PERMITS);
         Ok(Self {
             client: build_client(config)?,
             target_host: config.target_host.clone(),
@@ -78,6 +96,10 @@ impl App {
             rewriter: PathRewriter::new(config.path_prefix.clone()),
             missing: NegativeCache::default(),
             upstream_timeout: config.upstream_timeout,
+            upstream_slots: Arc::new(Semaphore::new(max_inflight_upstream)),
+            max_inflight_upstream,
+            busy_rejections: AtomicU64::new(0),
+            busy_last_warn: Mutex::new(None),
         })
     }
 
@@ -137,6 +159,15 @@ impl App {
     }
 
     async fn proxy(&self, req: Request<Incoming>, target: String) -> Response<ResponseBody> {
+        // Taken before contacting the upstream and moved into the response
+        // body below, so it is released when the body finishes, fails, or
+        // is dropped because the client disconnected. Every early return
+        // drops it with this frame.
+        let slot = self.upstream_slots.clone().acquire_owned();
+        let Ok(Ok(permit)) = tokio::time::timeout(UPSTREAM_SLOT_WAIT, slot).await else {
+            return self.busy_response(&target);
+        };
+
         let upstream_path = self.rewriter.rewrite(&rewrite::legacy_proxy_path(&target));
         let uri = match Uri::builder()
             .scheme("https")
@@ -199,8 +230,44 @@ impl App {
             );
         }
 
-        let body = UpstreamBody::new(body, self.upstream_timeout, target);
+        let body = UpstreamBody::new(body, self.upstream_timeout, target, permit);
         Response::from_parts(parts, ResponseBody::Upstream(body))
+    }
+
+    /// Every upstream slot is taken: shed the request instead of opening yet
+    /// another upstream stream, so a download flood can't push the pod past
+    /// its memory limit.
+    fn busy_response(&self, target: &str) -> Response<ResponseBody> {
+        self.busy_rejections.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut last = self
+                .busy_last_warn
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            if last.is_none_or(|t| now.duration_since(t) >= BUSY_WARN_INTERVAL) {
+                *last = Some(now);
+                let rejected = self.busy_rejections.swap(0, Ordering::Relaxed);
+                eprintln!(
+                    "Warning: all {} upstream slots busy (MAX_INFLIGHT_UPSTREAM); \
+                     answered {rejected} request(s) with 503 since the last warning. \
+                     Latest: {target}",
+                    self.max_inflight_upstream
+                );
+            }
+        }
+
+        let mut res = Response::new(ResponseBody::full("Server busy, please retry shortly."));
+        *res.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        let headers = res.headers_mut();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        headers.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static(BUSY_RETRY_AFTER),
+        );
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        add_cors_headers(headers);
+        res
     }
 
     fn error_response(
@@ -261,6 +328,8 @@ fn build_client(config: &Config) -> Result<UpstreamClient, String> {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_nodelay(true);
+    // Set before connect, so it also bounds the advertised receive window.
+    http.set_recv_buffer_size(config.upstream_recv_buffer);
 
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls)
@@ -437,15 +506,24 @@ pub struct UpstreamBody {
     timeout: Option<Duration>,
     idle: Option<Pin<Box<Sleep>>>,
     target: String,
+    /// This stream's upstream slot. Released as soon as the body ends or
+    /// fails, and otherwise when hyper drops the body (client disconnect).
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl UpstreamBody {
-    fn new(inner: Incoming, timeout: Option<Duration>, target: String) -> Self {
+    fn new(
+        inner: Incoming,
+        timeout: Option<Duration>,
+        target: String,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
         Self {
             inner,
             timeout,
             idle: timeout.map(|t| Box::pin(tokio::time::sleep(t))),
             target,
+            permit: Some(permit),
         }
     }
 }
@@ -482,9 +560,13 @@ impl Body for UpstreamBody {
                     "Upstream aborted mid-response. Request: {} {e}",
                     this.target
                 );
+                this.permit = None;
                 Poll::Ready(Some(Err(e.into())))
             }
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(None) => {
+                this.permit = None;
+                Poll::Ready(None)
+            }
             Poll::Pending => {
                 if let Some(idle) = this.idle.as_mut() {
                     ready!(idle.as_mut().poll(cx));
@@ -492,6 +574,7 @@ impl Body for UpstreamBody {
                         "Upstream aborted mid-response. Request: {} {IdleTimeout}",
                         this.target
                     );
+                    this.permit = None;
                     return Poll::Ready(Some(Err(Box::new(IdleTimeout))));
                 }
                 Poll::Pending

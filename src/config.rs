@@ -14,6 +14,20 @@ pub const DEFAULT_POOL_MAX_IDLE: usize = 256;
 /// Used when `PORT` is unset or empty.
 pub const DEFAULT_PORT: u16 = 8080;
 
+/// Used when `MAX_INFLIGHT_UPSTREAM` is unset, empty, or `0`. Each in-flight
+/// upstream fetch pins an upstream socket and a client socket for as long as
+/// the body streams; with the socket buffers capped below that is roughly
+/// 2-3 MiB of kernel and user-space buffers per stream at worst, so 64 of
+/// them fit comfortably in a 512Mi pod alongside the ~75 MB baseline, while
+/// still allowing a couple of thousand short misses per second per pod.
+pub const DEFAULT_MAX_INFLIGHT_UPSTREAM: usize = 64;
+
+/// Used for `UPSTREAM_RECV_BUFFER_BYTES` and `CLIENT_SEND_BUFFER_BYTES` when
+/// unset or empty. Linux doubles the value set (for bookkeeping overhead) and
+/// turns off autotuning for that socket, so each buffer tops out at 512 KiB
+/// instead of growing to the multi-megabyte `tcp_rmem`/`tcp_wmem` maximums.
+pub const DEFAULT_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// `PORT`: the port to listen on (all IPv4 interfaces).
@@ -33,6 +47,17 @@ pub struct Config {
     /// for the upstream, in addition to the bundled Mozilla roots. The Rust
     /// counterpart of `NODE_EXTRA_CA_CERTS`; used by the tests.
     pub extra_ca_certs: Option<PathBuf>,
+    /// `MAX_INFLIGHT_UPSTREAM`: how many upstream fetches (including their
+    /// streaming bodies) may be in flight at once. Requests beyond that get
+    /// a 503. Unset, empty, or `0` means [`DEFAULT_MAX_INFLIGHT_UPSTREAM`].
+    pub max_inflight_upstream: usize,
+    /// `UPSTREAM_RECV_BUFFER_BYTES`: `SO_RCVBUF` for upstream connections.
+    /// `None` (an explicit `0`) leaves it to the kernel's autotuning.
+    pub upstream_recv_buffer: Option<usize>,
+    /// `CLIENT_SEND_BUFFER_BYTES`: `SO_SNDBUF` for accepted client
+    /// connections. `None` (an explicit `0`) leaves it to the kernel's
+    /// autotuning.
+    pub client_send_buffer: Option<usize>,
 }
 
 impl Config {
@@ -64,6 +89,19 @@ impl Config {
             })?,
         };
 
+        let max_inflight_upstream = match non_empty("MAX_INFLIGHT_UPSTREAM") {
+            None => DEFAULT_MAX_INFLIGHT_UPSTREAM,
+            Some(v) => match v.trim().parse() {
+                Ok(0) => DEFAULT_MAX_INFLIGHT_UPSTREAM,
+                Ok(n) => n,
+                Err(_) => {
+                    return Err(format!(
+                        "MAX_INFLIGHT_UPSTREAM {v:?} is not a non-negative integer"
+                    ));
+                }
+            },
+        };
+
         Ok(Self {
             port,
             target_host,
@@ -71,7 +109,26 @@ impl Config {
             upstream_timeout: parse_upstream_timeout(get("UPSTREAM_TIMEOUT_MS").as_deref()),
             pool_max_idle,
             extra_ca_certs: non_empty("EXTRA_CA_CERTS").map(PathBuf::from),
+            max_inflight_upstream,
+            upstream_recv_buffer: socket_buffer(&non_empty, "UPSTREAM_RECV_BUFFER_BYTES")?,
+            client_send_buffer: socket_buffer(&non_empty, "CLIENT_SEND_BUFFER_BYTES")?,
         })
+    }
+}
+
+/// Unset or empty means [`DEFAULT_SOCKET_BUFFER_BYTES`]; an explicit `0`
+/// means "don't set it" (`None`).
+fn socket_buffer(
+    non_empty: &impl Fn(&str) -> Option<String>,
+    key: &str,
+) -> Result<Option<usize>, String> {
+    match non_empty(key) {
+        None => Ok(Some(DEFAULT_SOCKET_BUFFER_BYTES)),
+        Some(v) => match v.trim().parse() {
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Err(format!("{key} {v:?} is not a non-negative integer")),
+        },
     }
 }
 
@@ -199,6 +256,9 @@ mod tests {
                 upstream_timeout: Some(DEFAULT_UPSTREAM_TIMEOUT),
                 pool_max_idle: DEFAULT_POOL_MAX_IDLE,
                 extra_ca_certs: None,
+                max_inflight_upstream: DEFAULT_MAX_INFLIGHT_UPSTREAM,
+                upstream_recv_buffer: Some(DEFAULT_SOCKET_BUFFER_BYTES),
+                client_send_buffer: Some(DEFAULT_SOCKET_BUFFER_BYTES),
             }
         );
         // PORT="" falls back like `process.env.PORT || 8080`.
@@ -215,6 +275,9 @@ mod tests {
             ("UPSTREAM_TIMEOUT_MS", "0"),
             ("UPSTREAM_POOL_MAX_IDLE", "0"),
             ("EXTRA_CA_CERTS", "/tmp/ca.pem"),
+            ("MAX_INFLIGHT_UPSTREAM", "8"),
+            ("UPSTREAM_RECV_BUFFER_BYTES", "65536"),
+            ("CLIENT_SEND_BUFFER_BYTES", "0"),
         ])
         .unwrap();
         assert_eq!(c.port, 5000);
@@ -223,11 +286,28 @@ mod tests {
         assert_eq!(c.upstream_timeout, None);
         assert_eq!(c.pool_max_idle, 0);
         assert_eq!(c.extra_ca_certs, Some(PathBuf::from("/tmp/ca.pem")));
+        assert_eq!(c.max_inflight_upstream, 8);
+        assert_eq!(c.upstream_recv_buffer, Some(65536));
+        assert_eq!(c.client_send_buffer, None);
+    }
+
+    #[test]
+    fn max_inflight_upstream_zero_or_empty_means_the_default() {
+        for raw in ["0", "", " 0 "] {
+            let c = config(&[("TARGET_HOST", "h"), ("MAX_INFLIGHT_UPSTREAM", raw)]).unwrap();
+            assert_eq!(
+                c.max_inflight_upstream, DEFAULT_MAX_INFLIGHT_UPSTREAM,
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]
     fn rejects_invalid_numbers() {
         assert!(config(&[("TARGET_HOST", "h"), ("PORT", "http")]).is_err());
         assert!(config(&[("TARGET_HOST", "h"), ("UPSTREAM_POOL_MAX_IDLE", "-1")]).is_err());
+        assert!(config(&[("TARGET_HOST", "h"), ("MAX_INFLIGHT_UPSTREAM", "-1")]).is_err());
+        assert!(config(&[("TARGET_HOST", "h"), ("UPSTREAM_RECV_BUFFER_BYTES", "1k")]).is_err());
+        assert!(config(&[("TARGET_HOST", "h"), ("CLIENT_SEND_BUFFER_BYTES", "x")]).is_err());
     }
 }
