@@ -29,8 +29,10 @@ pub const DEFAULT_MAX_INFLIGHT_UPSTREAM: usize = 64;
 pub const DEFAULT_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 
 /// Used when `CLIENT_WRITE_TIMEOUT_MS` is unset or empty. Only time spent
-/// with a write to the client completely blocked counts, so this never cuts
-/// off a slow client that is still reading.
+/// with a write to the client blocked counts, but a client has to drain
+/// about a third of its send buffer within it to unblock a write, so this
+/// also sets a minimum client rate (very roughly 6 KB/s with the default
+/// buffer; see write_timeout.rs).
 pub const DEFAULT_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,7 +67,9 @@ pub struct Config {
     pub client_send_buffer: Option<usize>,
     /// `CLIENT_WRITE_TIMEOUT_MS`: how long a write to a client may make no
     /// progress before the connection (and the upstream slot its response
-    /// holds) is dropped. `None` (an explicit `0`) disables it.
+    /// holds) is dropped. Implies a minimum client drain rate of roughly a
+    /// third of the send buffer per timeout. `None` (an explicit `0`)
+    /// disables it.
     pub client_write_timeout: Option<Duration>,
 }
 

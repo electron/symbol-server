@@ -6,8 +6,20 @@
 //! (see `MAX_INFLIGHT_UPSTREAM`). This wrapper fails a write or flush that
 //! has made no progress for the timeout, which makes hyper tear down the
 //! connection and drop the body. The timer only runs while a write is
-//! blocked and restarts on every completed write, so slow clients that keep
-//! reading are never cut off, however long the download takes in total.
+//! blocked and restarts on every completed write, so total download time
+//! doesn't matter, only the client's drain rate.
+//!
+//! That rate has a floor. After a write would block, Linux only reports the
+//! socket writable again once about a third of `SO_SNDBUF` has drained
+//! (`sk_stream_is_writeable`), and no write is attempted before then. So a
+//! client must drain roughly a third of the (doubled) send buffer within
+//! each timeout: with the defaults, ~170 KB per 30s, i.e. very roughly
+//! 6 KB/s, and kernel bookkeeping overhead can push the real floor a few
+//! times higher. Anything slower is dropped as if it had stalled. At those
+//! rates the 758 MB electron.sym would take well over a day, so no real
+//! symbol client is affected. A precise check (e.g. polling `SIOCOUTQ` when
+//! the deadline fires) would need Linux-only unsafe ioctls and wasn't worth
+//! it for that.
 
 use std::future::Future;
 use std::io;

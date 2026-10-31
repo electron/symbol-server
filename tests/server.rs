@@ -800,11 +800,14 @@ async fn upstream_slot_is_released_when_the_client_stops_reading() {
     drop(client);
 }
 
-/// New: the write timeout only counts time with no progress at all, so a
-/// client that reads slowly but steadily gets the whole body even though
-/// the download takes several times CLIENT_WRITE_TIMEOUT_MS.
+/// New: the write timeout restarts on every completed write rather than
+/// bounding the whole download, so a client that keeps reading comfortably
+/// above the minimum drain rate (about a third of the doubled 4 KiB send
+/// buffer per 300ms here) gets the whole body even though the download
+/// takes several times CLIENT_WRITE_TIMEOUT_MS. Clients below that rate
+/// are dropped; this test doesn't cover them.
 #[tokio::test]
-async fn a_slow_but_steady_client_is_not_cut_off_by_the_write_timeout() {
+async fn a_client_reading_above_the_minimum_rate_outlasts_the_write_timeout() {
     use tokio::io::AsyncReadExt;
 
     let (server, _upstream) = start_proxy(
