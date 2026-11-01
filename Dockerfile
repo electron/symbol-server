@@ -9,7 +9,7 @@ COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 RUN cargo build --release --locked
 
-FROM alpine:3.22
+FROM alpine:3.24
 # tini: see ENTRYPOINT.
 RUN apk add --no-cache tini
 COPY --from=build /src/target/release/symbol-server /usr/local/bin/symbol-server
