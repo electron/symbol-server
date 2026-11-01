@@ -1,0 +1,21 @@
+# Lets a node drain (e.g. an AKS node-image upgrade) evict only one server
+# pod at a time, so the other keeps serving. Lives in the overlay, so the
+# base's namespace and labels are not applied to it; set them here.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: server
+  namespace: symbol-server
+  labels:
+    app.kubernetes.io/name: server
+    app.kubernetes.io/part-of: symbol-server
+    app.kubernetes.io/managed-by: argocd
+spec:
+  maxUnavailable: 1
+  # Without this, if both pods are unready (bad image, crashloop) the budget
+  # is already spent and every eviction is refused, which blocks node drains
+  # and upgrades. Unready pods aren't serving anyway, so let them go.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: server
