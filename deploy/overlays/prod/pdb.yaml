@@ -12,6 +12,10 @@ metadata:
     app.kubernetes.io/managed-by: argocd
 spec:
   maxUnavailable: 1
+  # Without this, if both pods are unready (bad image, crashloop) the budget
+  # is already spent and every eviction is refused, which blocks node drains
+  # and upgrades. Unready pods aren't serving anyway, so let them go.
+  unhealthyPodEvictionPolicy: AlwaysAllow
   selector:
     matchLabels:
       app.kubernetes.io/name: server
