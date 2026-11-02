@@ -61,3 +61,53 @@ patches:
         value:
           requests: { cpu: 250m, memory: 128Mi }
           limits: { memory: 512Mi }
+  - target:
+      kind: Deployment
+      name: server
+    patch: |-
+      # electron/infra runs an egress allowlist for this app (`egress_proxy`
+      # in terraform/global/ionic-platform-apps): its own DNS resolver, which
+      # answers the allowed hostnames with the egress proxy's address, and the
+      # proxy, which allows only the listed host, method and path
+      # combinations. Until infra sets `enforce = true` anything else is let
+      # through and logged; after that it is refused, the pod cannot reach
+      # kube-dns or the internet directly, and admission rejects pods in this
+      # namespace without this dnsConfig. The allowed hostnames live only in
+      # infra; nothing here names them.
+      - op: add
+        path: /spec/template/spec/dnsPolicy
+        value: None
+      - op: add
+        path: /spec/template/spec/dnsConfig
+        value:
+          nameservers:
+            - 10.0.0.209
+          searches:
+            - symbol-server.svc.cluster.local
+            - svc.cluster.local
+            - cluster.local
+          options:
+            - name: ndots
+              value: "5"
+      # The proxy's certificates come from a CA of this app's own, which
+      # cert-manager keeps renewed; trust-manager writes only the CA
+      # certificate into this ConfigMap, and leaf renewals never change it.
+      # EXTRA_CA_CERTS adds it to the bundled webpki roots rather than
+      # replacing them (build_client in src/proxy.rs).
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: egress-proxy-trust
+          configMap:
+            name: symbol-server-egress-trust
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: egress-proxy-trust
+          mountPath: /etc/egress-proxy
+          readOnly: true
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: EXTRA_CA_CERTS
+          value: /etc/egress-proxy/ca.crt

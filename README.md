@@ -69,7 +69,7 @@ The server is a small Rust binary configured through environment variables:
 | `UPSTREAM_RECV_BUFFER_BYTES` | `262144` | `SO_RCVBUF` for upstream connections (Linux doubles it and disables autotuning). `0` leaves it to the kernel. |
 | `CLIENT_SEND_BUFFER_BYTES` | `262144` | `SO_SNDBUF` for accepted client connections (Linux doubles it and disables autotuning). `0` leaves it to the kernel. |
 | `CLIENT_WRITE_TIMEOUT_MS` | `30000` | Drop a client connection (and release its upstream slot) once a write to it has made no progress for this long, e.g. a client that stopped reading mid-download without disconnecting. Total download time doesn't count, but because the kernel only reports the socket writable again after about a third of the send buffer drains, a client has to drain that much within each timeout: very roughly 6 KB/s with the defaults (more with a larger or autotuned `CLIENT_SEND_BUFFER_BYTES`), or it is dropped. `0` disables it. |
-| `EXTRA_CA_CERTS` | unset | PEM file of extra CA certificates to trust for the upstream (used by the tests). |
+| `EXTRA_CA_CERTS` | unset | PEM file of extra CA certificates to trust for the upstream, in addition to the bundled roots (used by the tests, and in production for the ionic-platform egress proxy's CA). |
 | `TOKIO_WORKER_THREADS` | CPU count | Worker threads for the async runtime. |
 
 ### Running locally
