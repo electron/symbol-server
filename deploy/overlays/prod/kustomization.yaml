@@ -2,6 +2,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../../base
+  - pdb.yaml
 replicas:
   # Stateless apart from a per-pod in-memory negative cache; two for
   # availability.
@@ -29,6 +30,17 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/readinessProbe/httpGet/path
         value: /health
+      # Prefer putting the replicas on different nodes, so draining one node
+      # doesn't evict both at once (see also pdb.yaml).
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: server
       # No secrets (`secrets = {}` in infra), so no server-secrets Secret is
       # created; without this the pod would never start.
       - op: add
