@@ -5,6 +5,7 @@ mod common;
 
 use bytes::Bytes;
 use common::*;
+use hyper::Method;
 use std::time::{Duration, Instant};
 
 const MISSING_CACHE_CONTROL: &str = "public, max-age=3600";
@@ -284,6 +285,128 @@ async fn upstream_404_is_passed_through_and_not_negative_cached() {
     let second = request(server.port, "/missing/foo.pdb/abc/foo.pdb", &[]).await;
     assert_eq!(second.status, 404);
     assert_eq!(upstream.request_count(), 2);
+}
+
+/// New: only GET and HEAD are served. Anything else gets an uncacheable 405
+/// without contacting upstream (whose egress proxy would refuse it with a
+/// 403), and leaves nothing in the negative cache.
+#[tokio::test]
+async fn methods_other_than_get_and_head_get_405_without_contacting_upstream() {
+    let (server, upstream) = start_proxy(ok_handler, None, &[]).await;
+
+    for method in ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+        let method = Method::from_bytes(method.as_bytes()).unwrap();
+        let res =
+            request_method(server.port, method.clone(), "/foo/bar.pdb/abc/foo.pdb", &[]).await;
+        assert_eq!(res.status, 405, "{method}");
+        assert_eq!(res.header("allow"), Some("GET, HEAD"), "{method}");
+        assert_eq!(res.header("cache-control"), Some("no-store"), "{method}");
+        assert_eq!(
+            res.header("access-control-allow-origin"),
+            Some("*"),
+            "{method}"
+        );
+    }
+    // Not even on the redirect branch.
+    let res = request_method(
+        server.port,
+        Method::POST,
+        "/foo/bar.pdb/abc/foo.pdb",
+        &[("x-electron-symbol-redirect", "1")],
+    )
+    .await;
+    assert_eq!(res.status, 405);
+    assert_eq!(upstream.request_count(), 0);
+
+    let res = request(server.port, "/foo/bar.pdb/abc/foo.pdb", &[]).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, "ok");
+    assert_eq!(upstream.request_count(), 1);
+}
+
+/// New: HEAD is forwarded upstream as a HEAD.
+#[tokio::test]
+async fn head_is_forwarded_upstream() {
+    let (server, upstream) = start_proxy(ok_handler, None, &[]).await;
+
+    let res = request_method(server.port, Method::HEAD, "/Foo/Bar.PDB/ABC/foo.pdb", &[]).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, "");
+    assert_eq!(res.header("cache-control"), Some(HIT_CACHE_CONTROL));
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "HEAD");
+    assert_eq!(requests[0].url, "/foo/bar.pdb/abc/foo.pdb");
+}
+
+/// New: a refusal from the egress proxy (marked `x-egress-proxy: deny`) is
+/// not the CDN's "no such object" 403. It becomes an uncacheable 502 with an
+/// error ID, is logged, and is not negative-cached, so the symbol is fetched
+/// again once the allowlist is fixed.
+#[tokio::test]
+async fn egress_proxy_denials_are_uncached_502s_not_misses() {
+    let (server, upstream) = start_proxy(
+        |_| async {
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            match CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => respond_with(403, &[("x-egress-proxy", "deny")], "egress denied\n"),
+                1 => respond_with(400, &[("x-egress-proxy", "deny")], ""),
+                _ => respond(200, "SYMBOL-DATA"),
+            }
+        },
+        None,
+        &[],
+    )
+    .await;
+
+    for (i, method) in [Method::GET, Method::HEAD].into_iter().enumerate() {
+        let res =
+            request_method(server.port, method.clone(), "/foo/bar.pdb/abc/foo.pdb", &[]).await;
+        assert_eq!(res.status, 502, "{method}");
+        assert_eq!(res.header("cache-control"), Some("no-store"), "{method}");
+        assert_eq!(res.header("x-egress-proxy"), None, "{method}");
+        if method == Method::GET {
+            assert_error_body(&res.body);
+        }
+        assert_eq!(upstream.request_count(), i + 1);
+    }
+
+    let res = request(server.port, "/foo/bar.pdb/abc/foo.pdb", &[]).await;
+    assert_eq!(
+        res.status, 200,
+        "a proxy denial must not be negative-cached"
+    );
+    assert_eq!(res.body, "SYMBOL-DATA");
+    assert_eq!(upstream.request_count(), 3);
+
+    let stderr = server.stderr();
+    assert!(
+        stderr.contains("egress proxy refused GET /foo/bar.pdb/abc/foo.pdb with 403 Forbidden"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("egress proxy refused HEAD /foo/bar.pdb/abc/foo.pdb with 400 Bad Request"),
+        "{stderr}"
+    );
+}
+
+/// New: only the proxy's exact marker counts; a CDN 403 carrying some other
+/// x-egress-proxy value is still a miss.
+#[tokio::test]
+async fn upstream_403_without_the_deny_marker_is_still_a_miss() {
+    let (server, upstream) = start_proxy(
+        |_| async { respond_with(403, &[("x-egress-proxy", "allow")], "") },
+        None,
+        &[],
+    )
+    .await;
+
+    let res = request(server.port, "/missing/foo.pdb/abc/foo.pdb", &[]).await;
+    assert_eq!(res.status, 404);
+    assert_eq!(res.header("cache-control"), Some(MISSING_CACHE_CONTROL));
+    let res = request(server.port, "/missing/foo.pdb/abc/foo.pdb", &[]).await;
+    assert_eq!(res.status, 404);
+    assert_eq!(upstream.request_count(), 1);
 }
 
 /// 'negative-cache 404s carry a public Cache-Control header'
