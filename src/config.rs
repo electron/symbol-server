@@ -52,7 +52,8 @@ pub struct Config {
     pub pool_max_idle: usize,
     /// `EXTRA_CA_CERTS`: optional PEM file of extra CA certificates to trust
     /// for the upstream, in addition to the bundled Mozilla roots. The Rust
-    /// counterpart of `NODE_EXTRA_CA_CERTS`; used by the tests.
+    /// counterpart of `NODE_EXTRA_CA_CERTS`; used by the tests, and in
+    /// production for the ionic-platform egress proxy's CA.
     pub extra_ca_certs: Option<PathBuf>,
     /// `MAX_INFLIGHT_UPSTREAM`: how many 2xx upstream response bodies may be
     /// streaming at once. Further 2xx responses are dropped for a 503;
