@@ -174,6 +174,12 @@ impl App {
 
     async fn proxy(&self, req: Request<Incoming>, target: String) -> Response<ResponseBody> {
         let upstream_path = self.rewriter.rewrite(&rewrite::legacy_proxy_path(&target));
+        // Checked after rewriting, which strips the one escaped-backslash
+        // prefix that maps onto real symbols (`/c%3a%5cprojects%5c...`).
+        let path_only = upstream_path.split('?').next().unwrap_or_default();
+        if has_escaped_separator(path_only) {
+            return escaped_separator_miss();
+        }
         let uri = match Uri::builder()
             .scheme("https")
             .authority(self.target_host.as_str())
@@ -406,6 +412,34 @@ fn method_not_allowed() -> Response<ResponseBody> {
     let headers = res.headers_mut();
     headers.insert(header::ALLOW, HeaderValue::from_static(ALLOW));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    add_cors_headers(headers);
+    res
+}
+
+/// Whether a (still percent-encoded) path contains an escaped slash or
+/// backslash (`%2F` or `%5C`, either case). The egress proxy rejects such
+/// paths with a 400, and no symbol can live at one: debuggers send them when
+/// a PDB path such as `c:\...\electron.exe.pdb` is escaped into the URL.
+fn has_escaped_separator(path: &str) -> bool {
+    path.as_bytes().windows(3).any(|w| {
+        w[0] == b'%'
+            && (w[1] == b'2' && w[2].eq_ignore_ascii_case(&b'f')
+                || w[1] == b'5' && w[2].eq_ignore_ascii_case(&b'c'))
+    })
+}
+
+/// The answer for an upstream path with an escaped separator: the same 404
+/// as an upstream miss, made here instead of sending upstream a request the
+/// egress proxy would reject. It is not put in the negative cache, since
+/// this check is cheaper than a lookup.
+fn escaped_separator_miss() -> Response<ResponseBody> {
+    let mut res = Response::new(ResponseBody::empty());
+    *res.status_mut() = StatusCode::NOT_FOUND;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(MISSING_CACHE_CONTROL),
+    );
     add_cors_headers(headers);
     res
 }

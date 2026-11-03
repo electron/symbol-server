@@ -16,7 +16,7 @@ Many web servers treat URLs case-insensitively. S3 does not. So one job of Pepto
 
 In addition, if you try to access a file that doesn't exist on S3, you will get a [403 Forbidden](http://en.wikipedia.org/wiki/HTTP_403) error, rather than [404 Not Found](http://en.wikipedia.org/wiki/HTTP_404). When `symsrv.dll` gets a 403 error from a symbol server, it blacklists that server for the rest of the debugging session. So Pepto Symbol also converts 403 errors to 404 errors.
 
-Only `GET` and `HEAD` are served; other methods get a `405` with `Allow: GET, HEAD` and are never sent upstream. In production the upstream is reached through the ionic-platform egress proxy, which marks its own refusals with `x-egress-proxy: deny`. Such a response is not the store's answer, so it is never converted to a 404 or cached as a missing symbol: the client gets an uncacheable `502` and the server logs an error.
+Only `GET` and `HEAD` are served; other methods get a `405` with `Allow: GET, HEAD` and are never sent upstream. In production the upstream is reached through the ionic-platform egress proxy, which marks its own refusals with `x-egress-proxy: deny`. Such a response is not the store's answer, so it is never converted to a 404 or cached as a missing symbol: the client gets an uncacheable `502` and the server logs an error. A request whose upstream path (after the rewrites above) still contains an escaped slash or backslash (`%2F` or `%5C`, in either case) gets the usual missing-symbol `404` without being sent upstream, since the egress proxy rejects such paths and no symbol can live at one.
 
 ## Requirements
 
