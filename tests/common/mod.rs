@@ -7,7 +7,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::HeaderMap;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::future::Future;
 use std::io::Read;
@@ -339,12 +339,25 @@ pub enum BodyEnd {
 /// Sends a GET on a fresh connection and returns the head plus a body that
 /// can be read incrementally.
 pub async fn send(port: u16, path: &str, headers: &[(&str, &str)]) -> Response<Incoming> {
+    send_method(port, Method::GET, path, headers).await
+}
+
+/// `send` with another method.
+pub async fn send_method(
+    port: u16,
+    method: Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Response<Incoming> {
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .unwrap();
     tokio::spawn(conn);
-    let mut req = Request::get(path).header("host", format!("127.0.0.1:{port}"));
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", format!("127.0.0.1:{port}"));
     for (name, value) in headers {
         req = req.header(*name, *value);
     }
@@ -371,7 +384,17 @@ pub async fn read_body(mut body: Incoming) -> (String, BodyEnd) {
 }
 
 pub async fn request(port: u16, path: &str, headers: &[(&str, &str)]) -> TestResponse {
-    let res = send(port, path, headers).await;
+    request_method(port, Method::GET, path, headers).await
+}
+
+/// `request` with another method.
+pub async fn request_method(
+    port: u16,
+    method: Method,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> TestResponse {
+    let res = send_method(port, method, path, headers).await;
     let status = res.status().as_u16();
     let (parts, body) = res.into_parts();
     let (body, end) = read_body(body).await;

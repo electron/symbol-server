@@ -9,7 +9,7 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
-use hyper::{Request, Response, StatusCode, Uri, Version};
+use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -53,6 +53,14 @@ const CLOUDFLARE_CDN_CACHE_CONTROL: HeaderName =
     HeaderName::from_static("cloudflare-cdn-cache-control");
 const X_ELECTRON_SYMBOL_REDIRECT: HeaderName =
     HeaderName::from_static("x-electron-symbol-redirect");
+/// Set to `deny` on every response the ionic-platform egress proxy makes
+/// itself instead of forwarding the request to the upstream (electron/infra,
+/// modules/ionic-app).
+const X_EGRESS_PROXY: HeaderName = HeaderName::from_static("x-egress-proxy");
+
+/// The only methods served (and forwarded upstream). The egress proxy only
+/// allows these, and a symbol store has nothing else to offer.
+const ALLOW: &str = "GET, HEAD";
 
 /// Connection-level headers that describe a single hop and must not be
 /// forwarded in either direction (RFC 9110 section 7.6.1).
@@ -121,6 +129,10 @@ impl App {
             return Ok(Response::new(ResponseBody::full("Alive")));
         }
 
+        if req.method() != Method::GET && req.method() != Method::HEAD {
+            return Ok(method_not_allowed());
+        }
+
         let cache_key = self.rewriter.rewrite(&format!("{pathname}{search}"));
 
         if wants_redirect(req.headers()) {
@@ -162,6 +174,12 @@ impl App {
 
     async fn proxy(&self, req: Request<Incoming>, target: String) -> Response<ResponseBody> {
         let upstream_path = self.rewriter.rewrite(&rewrite::legacy_proxy_path(&target));
+        // Checked after rewriting, which strips the one escaped-backslash
+        // prefix that maps onto real symbols (`/c%3a%5cprojects%5c...`).
+        let path_only = upstream_path.split('?').next().unwrap_or_default();
+        if has_escaped_separator(path_only) {
+            return escaped_separator_miss();
+        }
         let uri = match Uri::builder()
             .scheme("https")
             .authority(self.target_host.as_str())
@@ -174,6 +192,7 @@ impl App {
 
         let (parts, body) = req.into_parts();
         let mut upstream_req = Request::new(body);
+        let method = parts.method.clone();
         *upstream_req.method_mut() = parts.method;
         *upstream_req.uri_mut() = uri;
         *upstream_req.version_mut() = Version::HTTP_11;
@@ -199,6 +218,24 @@ impl App {
                 return self.error_response(&target, &e, is_timeout);
             }
         };
+
+        // The egress proxy refused the request itself (a 403 for a request
+        // its allowlist does not cover, a 400 for a malformed one), which
+        // says nothing about whether the symbol exists: never take it for a
+        // CDN miss (and negative-cache it), but answer an uncacheable 502.
+        if upstream_res
+            .headers()
+            .get_all(X_EGRESS_PROXY)
+            .iter()
+            .any(|v| v == "deny")
+        {
+            let err = format!(
+                "egress proxy refused {method} {upstream_path} with {}; \
+                 its allowlist does not cover this request",
+                upstream_res.status(),
+            );
+            return self.error_response_with_status(&target, &err, StatusCode::BAD_GATEWAY);
+        }
 
         // Only 2xx bodies (the symbol files themselves, some hundreds of MB)
         // count against the cap; misses and errors are small and pass
@@ -288,15 +325,24 @@ impl App {
         err: &dyn std::fmt::Display,
         is_timeout: bool,
     ) -> Response<ResponseBody> {
-        let error_id = uuid::Uuid::new_v4();
-        eprintln!("Error: {error_id} Request: {target} {err}");
-
         // A stalled upstream answers 504; anything else is a generic 500.
         let status = if is_timeout {
             StatusCode::GATEWAY_TIMEOUT
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
+        self.error_response_with_status(target, err, status)
+    }
+
+    fn error_response_with_status(
+        &self,
+        target: &str,
+        err: &dyn std::fmt::Display,
+        status: StatusCode,
+    ) -> Response<ResponseBody> {
+        let error_id = uuid::Uuid::new_v4();
+        eprintln!("Error: {error_id} Request: {target} {err}");
+
         let mut res = Response::new(ResponseBody::full(format!(
             "Something went wrong. If this happens consistently please report to \
              https://github.com/electron/symbol-server with this error ID: \"{error_id}\""
@@ -355,6 +401,47 @@ fn build_client(config: &Config) -> Result<UpstreamClient, String> {
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .pool_max_idle_per_host(config.pool_max_idle)
         .build(https))
+}
+
+/// Anything but GET or HEAD is answered here, never forwarded: the egress
+/// proxy refuses other methods, and its refusal must not reach the 403 → 404
+/// miss handling (or the negative cache, which is keyed by path alone).
+fn method_not_allowed() -> Response<ResponseBody> {
+    let mut res = Response::new(ResponseBody::empty());
+    *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+    let headers = res.headers_mut();
+    headers.insert(header::ALLOW, HeaderValue::from_static(ALLOW));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    add_cors_headers(headers);
+    res
+}
+
+/// Whether a (still percent-encoded) path contains an escaped slash or
+/// backslash (`%2F` or `%5C`, either case). The egress proxy rejects such
+/// paths with a 400, and no symbol can live at one: debuggers send them when
+/// a PDB path such as `c:\...\electron.exe.pdb` is escaped into the URL.
+fn has_escaped_separator(path: &str) -> bool {
+    path.as_bytes().windows(3).any(|w| {
+        w[0] == b'%'
+            && (w[1] == b'2' && w[2].eq_ignore_ascii_case(&b'f')
+                || w[1] == b'5' && w[2].eq_ignore_ascii_case(&b'c'))
+    })
+}
+
+/// The answer for an upstream path with an escaped separator: the same 404
+/// as an upstream miss, made here instead of sending upstream a request the
+/// egress proxy would reject. It is not put in the negative cache, since
+/// this check is cheaper than a lookup.
+fn escaped_separator_miss() -> Response<ResponseBody> {
+    let mut res = Response::new(ResponseBody::empty());
+    *res.status_mut() = StatusCode::NOT_FOUND;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(MISSING_CACHE_CONTROL),
+    );
+    add_cors_headers(headers);
+    res
 }
 
 /// The redirect branch serves Sentry's symbolicator and anything that opts
