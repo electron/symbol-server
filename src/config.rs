@@ -39,9 +39,16 @@ pub const DEFAULT_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Config {
     /// `PORT`: the port to listen on (all IPv4 interfaces).
     pub port: u16,
-    /// `TARGET_HOST`: the upstream host (and optional port) symbols are
-    /// fetched from over HTTPS. Required.
+    /// `TARGET_HOST`: the public host (and optional port) of the symbol
+    /// store, which the redirect branch sends clients to. Also where symbols
+    /// are fetched from, unless `UPSTREAM_HOST` says otherwise. Required.
     pub target_host: String,
+    /// `UPSTREAM_HOST`: the host (and optional port) this server fetches
+    /// symbols from over HTTPS, sent as both the TLS SNI and the `Host`
+    /// header. Unset or empty means `TARGET_HOST`. Lets the server read the
+    /// store's origin directly while redirected clients keep using the
+    /// public host in front of it.
+    pub upstream_host: String,
     /// `PATH_PREFIX`: prepended to every rewritten upstream path.
     pub path_prefix: String,
     /// `UPSTREAM_TIMEOUT_MS`: how long an upstream fetch may go without
@@ -89,6 +96,13 @@ impl Config {
             .parse::<hyper::http::uri::Authority>()
             .map_err(|e| format!("TARGET_HOST {target_host:?} is not a valid host[:port]: {e}"))?;
 
+        let upstream_host = non_empty("UPSTREAM_HOST").unwrap_or_else(|| target_host.clone());
+        upstream_host
+            .parse::<hyper::http::uri::Authority>()
+            .map_err(|e| {
+                format!("UPSTREAM_HOST {upstream_host:?} is not a valid host[:port]: {e}")
+            })?;
+
         let port = match non_empty("PORT") {
             None => DEFAULT_PORT,
             Some(v) => v
@@ -133,6 +147,7 @@ impl Config {
         Ok(Self {
             port,
             target_host,
+            upstream_host,
             path_prefix: get("PATH_PREFIX").unwrap_or_default(),
             upstream_timeout: parse_upstream_timeout(get("UPSTREAM_TIMEOUT_MS").as_deref()),
             pool_max_idle,
@@ -281,6 +296,7 @@ mod tests {
             Config {
                 port: 8080,
                 target_host: "symbols.example.test".into(),
+                upstream_host: "symbols.example.test".into(),
                 path_prefix: String::new(),
                 upstream_timeout: Some(DEFAULT_UPSTREAM_TIMEOUT),
                 pool_max_idle: DEFAULT_POOL_MAX_IDLE,
@@ -300,6 +316,7 @@ mod tests {
     fn reads_all_variables() {
         let c = config(&[
             ("TARGET_HOST", "127.0.0.1:8443"),
+            ("UPSTREAM_HOST", "origin.example.test"),
             ("PORT", "5000"),
             ("PATH_PREFIX", "/release/symbols"),
             ("UPSTREAM_TIMEOUT_MS", "0"),
@@ -313,6 +330,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.port, 5000);
         assert_eq!(c.target_host, "127.0.0.1:8443");
+        assert_eq!(c.upstream_host, "origin.example.test");
         assert_eq!(c.path_prefix, "/release/symbols");
         assert_eq!(c.upstream_timeout, None);
         assert_eq!(c.pool_max_idle, 0);
@@ -323,6 +341,25 @@ mod tests {
         assert_eq!(c.client_write_timeout, Some(Duration::from_millis(1500)));
         let c = config(&[("TARGET_HOST", "h"), ("CLIENT_WRITE_TIMEOUT_MS", "0")]).unwrap();
         assert_eq!(c.client_write_timeout, None);
+    }
+
+    #[test]
+    fn upstream_host_defaults_to_target_host() {
+        let c = config(&[
+            ("TARGET_HOST", "symbols.example.test"),
+            ("UPSTREAM_HOST", ""),
+        ])
+        .unwrap();
+        assert_eq!(c.upstream_host, "symbols.example.test");
+        assert!(
+            config(&[
+                ("TARGET_HOST", "symbols.example.test"),
+                ("UPSTREAM_HOST", "not a host")
+            ])
+            .is_err()
+        );
+        // It does not stand in for TARGET_HOST, which the redirects need.
+        assert!(config(&[("UPSTREAM_HOST", "origin.example.test")]).is_err());
     }
 
     #[test]
