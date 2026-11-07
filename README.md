@@ -62,7 +62,8 @@ The server is a small Rust binary configured through environment variables:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `TARGET_HOST` | (required) | Upstream host (and optional port) that symbols are fetched from over HTTPS. |
+| `TARGET_HOST` | (required) | Public host (and optional port) of the symbol store. Redirected clients (Sentry's symbolicator, `x-electron-symbol-redirect: 1`) are sent to `https://TARGET_HOST/...`, and symbols are fetched from it over HTTPS unless `UPSTREAM_HOST` is set. |
+| `UPSTREAM_HOST` | `TARGET_HOST` | Host (and optional port) symbols are actually fetched from over HTTPS, sent as the TLS SNI and `Host` header; redirects still use `TARGET_HOST`. Production sets it to the store's Azure blob endpoint, so fetches skip the CDN in front of it while the paths (the `symbols` container, with `PATH_PREFIX=/symbols`) stay the same. |
 | `PATH_PREFIX` | empty | Prepended to every upstream path. |
 | `PORT` | `8080` | Port to listen on. |
 | `UPSTREAM_TIMEOUT_MS` | `10000` | Abandon an upstream fetch that makes no progress for this long (504 before headers; aborted connection mid-body). `0` disables it. |

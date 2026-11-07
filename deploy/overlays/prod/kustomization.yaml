@@ -52,6 +52,16 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/env/-
         value: { name: PATH_PREFIX, value: /symbols }
+      # Fetch from the storage account behind artifacts.electronjs.org
+      # directly rather than back out through Cloudflare, whose Cloud
+      # Connector maps artifacts.electronjs.org/<path> onto this host's
+      # /<path> unchanged (the `symbols` container, hence PATH_PREFIX).
+      # Redirected clients (Sentry's symbolicator) still go to TARGET_HOST.
+      # electron/infra must allow this host in symbol-server's egress_proxy
+      # rules before this deploys.
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: { name: UPSTREAM_HOST, value: electronartifacts.blob.core.windows.net }
       # Otherwise tokio starts one worker per node CPU (there is no CPU limit).
       - op: add
         path: /spec/template/spec/containers/0/env/-

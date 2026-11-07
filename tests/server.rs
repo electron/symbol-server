@@ -109,6 +109,73 @@ async fn x_electron_symbol_redirect_other_values_are_proxied() {
     assert_eq!(upstream.request_count(), 3);
 }
 
+/// New: `UPSTREAM_HOST` takes the upstream fetches (URI, TLS SNI and Host
+/// header) while redirected clients are still sent to `TARGET_HOST`.
+#[tokio::test]
+async fn upstream_host_takes_fetches_while_redirects_keep_target_host() {
+    let upstream = start_upstream(ok_handler).await;
+    // The fixture certificate's DNS name, so the SNI is sent (rustls sends
+    // none for an IP address).
+    let upstream_host = format!("localhost:{}", upstream.port);
+    let server = start_symbol_server(ServerOptions {
+        // Does not resolve: a fetch sent here would fail with a 500.
+        target_host: Some("symbols.example.test"),
+        path_prefix: Some("/symbols"),
+        extra_env: &[("UPSTREAM_HOST", &upstream_host)],
+    })
+    .await
+    .unwrap();
+
+    let res = request(server.port, "/Foo.PDB/ABC/foo.pdb", &[]).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, "ok");
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url, "/symbols/foo.pdb/abc/foo.pdb");
+    assert_eq!(requests[0].headers["host"], upstream_host.as_str());
+    assert_eq!(requests[0].sni.as_deref(), Some("localhost"));
+
+    for headers in [
+        &[("x-electron-symbol-redirect", "1")][..],
+        &[("user-agent", "symbolicator/1.2.3")][..],
+    ] {
+        let res = request(server.port, "/Foo.PDB/ABC/foo.pdb", headers).await;
+        assert_eq!(res.status, 302);
+        assert_eq!(
+            res.header("location"),
+            Some("https://symbols.example.test/symbols/foo.pdb/abc/foo.pdb")
+        );
+    }
+    assert_eq!(upstream.request_count(), 1);
+}
+
+/// New: without `UPSTREAM_HOST`, fetches go to `TARGET_HOST` (with it as
+/// the TLS SNI and Host header), as they always did.
+#[tokio::test]
+async fn upstream_host_defaults_to_target_host() {
+    let upstream = start_upstream(ok_handler).await;
+    let target_host = format!("localhost:{}", upstream.port);
+    let server = server_for(&target_host).await;
+
+    let res = request(server.port, "/foo/bar", &[]).await;
+    assert_eq!(res.status, 200);
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].headers["host"], target_host.as_str());
+    assert_eq!(requests[0].sni.as_deref(), Some("localhost"));
+
+    let res = request(
+        server.port,
+        "/foo/bar",
+        &[("x-electron-symbol-redirect", "1")],
+    )
+    .await;
+    assert_eq!(
+        res.header("location"),
+        Some(format!("https://{target_host}/foo/bar").as_str())
+    );
+}
+
 /// 'non-symbolicator user-agents do NOT get redirected'
 #[tokio::test]
 async fn non_symbolicator_user_agents_do_not_get_redirected() {

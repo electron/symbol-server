@@ -80,8 +80,12 @@ type UpstreamClient = Client<HttpsConnector<HttpConnector>, Incoming>;
 
 pub struct App {
     client: UpstreamClient,
+    /// Where the redirect branch sends clients (`TARGET_HOST`).
     target_host: String,
-    target_host_header: HeaderValue,
+    /// Where symbols are fetched from (`UPSTREAM_HOST`, by default
+    /// `TARGET_HOST`), and its `Host` header.
+    upstream_host: String,
+    upstream_host_header: HeaderValue,
     rewriter: PathRewriter,
     missing: NegativeCache,
     upstream_timeout: Option<Duration>,
@@ -96,13 +100,14 @@ pub struct App {
 
 impl App {
     pub fn new(config: &Config) -> Result<Self, String> {
-        let target_host_header = HeaderValue::from_str(&config.target_host)
-            .map_err(|e| format!("TARGET_HOST is not a valid Host header: {e}"))?;
+        let upstream_host_header = HeaderValue::from_str(&config.upstream_host)
+            .map_err(|e| format!("UPSTREAM_HOST is not a valid Host header: {e}"))?;
         let max_inflight_upstream = config.max_inflight_upstream.min(Semaphore::MAX_PERMITS);
         Ok(Self {
             client: build_client(config)?,
             target_host: config.target_host.clone(),
-            target_host_header,
+            upstream_host: config.upstream_host.clone(),
+            upstream_host_header,
             rewriter: PathRewriter::new(config.path_prefix.clone()),
             missing: NegativeCache::default(),
             upstream_timeout: config.upstream_timeout,
@@ -182,7 +187,7 @@ impl App {
         }
         let uri = match Uri::builder()
             .scheme("https")
-            .authority(self.target_host.as_str())
+            .authority(self.upstream_host.as_str())
             .path_and_query(upstream_path.as_str())
             .build()
         {
@@ -200,8 +205,10 @@ impl App {
         *headers = parts.headers;
         strip_hop_by_hop(headers);
         headers.remove(header::EXPECT);
-        // The upstream CDN picks the bucket from the Host header.
-        headers.insert(header::HOST, self.target_host_header.clone());
+        // The upstream picks the bucket (CDN) or storage account (blob
+        // endpoint) from the Host header, so it must name the host connected
+        // to (and sent as the TLS SNI, which comes from the URI above).
+        headers.insert(header::HOST, self.upstream_host_header.clone());
 
         let fetch = self.client.request(upstream_req);
         let result = match self.upstream_timeout {

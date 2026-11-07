@@ -69,6 +69,8 @@ pub struct RecordedRequest {
     pub url: String,
     pub method: String,
     pub headers: HeaderMap,
+    /// The TLS SNI the client sent on this request's connection, if any.
+    pub sni: Option<String>,
 }
 
 /// Fake upstream HTTPS server. Calls the handler for each request and
@@ -131,11 +133,13 @@ where
                     let Ok(stream) = tls.accept(stream).await else {
                         return;
                     };
+                    let sni = stream.get_ref().1.server_name().map(str::to_owned);
                     let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                         requests.lock().unwrap().push(RecordedRequest {
                             url: req.uri().to_string(),
                             method: req.method().to_string(),
                             headers: req.headers().clone(),
+                            sni: sni.clone(),
                         });
                         let fut = handler(req);
                         async move { Ok::<_, std::convert::Infallible>(fut.await) }
@@ -217,6 +221,7 @@ pub async fn start_symbol_server(opts: ServerOptions<'_>) -> Result<SymbolServer
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_symbol-server"));
     for var in [
         "TARGET_HOST",
+        "UPSTREAM_HOST",
         "PATH_PREFIX",
         "UPSTREAM_TIMEOUT_MS",
         "UPSTREAM_POOL_MAX_IDLE",
