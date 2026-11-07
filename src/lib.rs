@@ -1,7 +1,6 @@
 //! A case-insensitive symbol server for Electron: a thin HTTP proxy in front
-//! of the artifact store that fixes up symsrv.dll/symstore.exe path quirks,
-//! turns the store's 403s into 404s, and keeps a pool of keep-alive
-//! connections to the upstream.
+//! of the artifact store that fixes up symsrv.dll/symstore.exe path quirks
+//! and keeps a pool of keep-alive connections to the upstream.
 
 pub mod config;
 pub mod negative_cache;

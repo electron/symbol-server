@@ -91,7 +91,7 @@ pub struct App {
     upstream_timeout: Option<Duration>,
     /// One permit per in-flight 2xx response stream, held until the body
     /// has finished streaming (or the client goes away). Non-2xx responses
-    /// (404s, 403s turned into 404s, errors) never take one.
+    /// (404s, errors) never take one.
     upstream_slots: Arc<Semaphore>,
     max_inflight_upstream: usize,
     busy_rejections: AtomicU64,
@@ -204,6 +204,7 @@ impl App {
         let headers = upstream_req.headers_mut();
         *headers = parts.headers;
         strip_hop_by_hop(headers);
+        strip_client_credentials(headers);
         headers.remove(header::EXPECT);
         // The upstream picks the bucket (CDN) or storage account (blob
         // endpoint) from the Host header, so it must name the host connected
@@ -228,8 +229,8 @@ impl App {
 
         // The egress proxy refused the request itself (a 403 for a request
         // its allowlist does not cover, a 400 for a malformed one), which
-        // says nothing about whether the symbol exists: never take it for a
-        // CDN miss (and negative-cache it), but answer an uncacheable 502.
+        // says nothing about whether the symbol exists: answer an
+        // uncacheable 502 and log it as the proxy's refusal.
         if upstream_res
             .headers()
             .get_all(X_EGRESS_PROXY)
@@ -241,6 +242,17 @@ impl App {
                  its allowlist does not cover this request",
                 upstream_res.status(),
             );
+            return self.error_response_with_status(&target, &err, StatusCode::BAD_GATEWAY);
+        }
+
+        // The store answers a missing blob with 404 (passed through below),
+        // so a 403 means it refused us: a credential it rejected, or the
+        // account refusing this pod. That says nothing about the symbol, so
+        // it must not be negative-cached as a miss for everyone, nor reach
+        // symsrv.dll as a 403 (which blacklists the server for the rest of
+        // the debugging session): answer an uncacheable 502 instead.
+        if upstream_res.status() == StatusCode::FORBIDDEN {
+            let err = format!("upstream refused {method} {upstream_path} with 403");
             return self.error_response_with_status(&target, &err, StatusCode::BAD_GATEWAY);
         }
 
@@ -269,17 +281,7 @@ impl App {
         // upstream headers over the ones set here.
         add_cors_headers(&mut parts.headers);
 
-        if parts.status == StatusCode::FORBIDDEN {
-            // The CDN returns 403 for objects that don't exist, but symsrv.dll
-            // blacklists a server for the rest of the debugging session when
-            // it sees a 403, so answer 404 instead and remember the miss.
-            self.missing.insert(upstream_path);
-            parts.status = StatusCode::NOT_FOUND;
-            parts.headers.insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static(MISSING_CACHE_CONTROL),
-            );
-        } else if parts.status == StatusCode::OK && lacks_cache_control(&parts.headers) {
+        if parts.status == StatusCode::OK && lacks_cache_control(&parts.headers) {
             parts.headers.insert(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static(HIT_CACHE_CONTROL),
@@ -411,8 +413,7 @@ fn build_client(config: &Config) -> Result<UpstreamClient, String> {
 }
 
 /// Anything but GET or HEAD is answered here, never forwarded: the egress
-/// proxy refuses other methods, and its refusal must not reach the 403 → 404
-/// miss handling (or the negative cache, which is keyed by path alone).
+/// proxy refuses other methods, and a store has nothing else to offer.
 fn method_not_allowed() -> Response<ResponseBody> {
     let mut res = Response::new(ResponseBody::empty());
     *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
@@ -475,6 +476,27 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
         headers.remove(*name);
     }
     for name in listed {
+        headers.remove(name);
+    }
+}
+
+/// Drops the client's credentials and storage-protocol headers before the
+/// request goes upstream. The store would evaluate them (a stray
+/// `Authorization` makes the Azure blob endpoint answer 403
+/// AuthenticationFailed even for a public blob), and they are the client's
+/// business, not the store's. Everything else (Range, If-*, Accept-Encoding,
+/// User-Agent, ...) is still forwarded.
+fn strip_client_credentials(headers: &mut HeaderMap) {
+    headers.remove(header::AUTHORIZATION);
+    headers.remove(header::PROXY_AUTHORIZATION);
+    headers.remove(header::COOKIE);
+    // HeaderName is always lowercase.
+    let ms: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("x-ms-"))
+        .cloned()
+        .collect();
+    for name in ms {
         headers.remove(name);
     }
 }
