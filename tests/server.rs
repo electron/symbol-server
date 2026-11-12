@@ -109,6 +109,73 @@ async fn x_electron_symbol_redirect_other_values_are_proxied() {
     assert_eq!(upstream.request_count(), 3);
 }
 
+/// New: `UPSTREAM_HOST` takes the upstream fetches (URI, TLS SNI and Host
+/// header) while redirected clients are still sent to `TARGET_HOST`.
+#[tokio::test]
+async fn upstream_host_takes_fetches_while_redirects_keep_target_host() {
+    let upstream = start_upstream(ok_handler).await;
+    // The fixture certificate's DNS name, so the SNI is sent (rustls sends
+    // none for an IP address).
+    let upstream_host = format!("localhost:{}", upstream.port);
+    let server = start_symbol_server(ServerOptions {
+        // Does not resolve: a fetch sent here would fail with a 500.
+        target_host: Some("symbols.example.test"),
+        path_prefix: Some("/symbols"),
+        extra_env: &[("UPSTREAM_HOST", &upstream_host)],
+    })
+    .await
+    .unwrap();
+
+    let res = request(server.port, "/Foo.PDB/ABC/foo.pdb", &[]).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.body, "ok");
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url, "/symbols/foo.pdb/abc/foo.pdb");
+    assert_eq!(requests[0].headers["host"], upstream_host.as_str());
+    assert_eq!(requests[0].sni.as_deref(), Some("localhost"));
+
+    for headers in [
+        &[("x-electron-symbol-redirect", "1")][..],
+        &[("user-agent", "symbolicator/1.2.3")][..],
+    ] {
+        let res = request(server.port, "/Foo.PDB/ABC/foo.pdb", headers).await;
+        assert_eq!(res.status, 302);
+        assert_eq!(
+            res.header("location"),
+            Some("https://symbols.example.test/symbols/foo.pdb/abc/foo.pdb")
+        );
+    }
+    assert_eq!(upstream.request_count(), 1);
+}
+
+/// New: without `UPSTREAM_HOST`, fetches go to `TARGET_HOST` (with it as
+/// the TLS SNI and Host header), as they always did.
+#[tokio::test]
+async fn upstream_host_defaults_to_target_host() {
+    let upstream = start_upstream(ok_handler).await;
+    let target_host = format!("localhost:{}", upstream.port);
+    let server = server_for(&target_host).await;
+
+    let res = request(server.port, "/foo/bar", &[]).await;
+    assert_eq!(res.status, 200);
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].headers["host"], target_host.as_str());
+    assert_eq!(requests[0].sni.as_deref(), Some("localhost"));
+
+    let res = request(
+        server.port,
+        "/foo/bar",
+        &[("x-electron-symbol-redirect", "1")],
+    )
+    .await;
+    assert_eq!(
+        res.header("location"),
+        Some(format!("https://{target_host}/foo/bar").as_str())
+    );
+}
+
 /// 'non-symbolicator user-agents do NOT get redirected'
 #[tokio::test]
 async fn non_symbolicator_user_agents_do_not_get_redirected() {
@@ -203,42 +270,90 @@ async fn proxy_applies_app_aliasing_before_forwarding() {
     assert_eq!(requests[0].url, "/electron/foo.pdb/abc/file");
 }
 
-/// 'upstream 403 is converted to 404 (and CORS headers set)'
+/// New: replaces 'upstream 403 is converted to 404 (and CORS headers set)'
+/// and 'subsequent requests for known-missing symbols are served from cache
+/// as 404'. The store answers misses with 404, so a 403 means it refused the
+/// request (e.g. a credential it rejected). That becomes an uncacheable 502
+/// with an error ID, is logged, and is not negative-cached, so the next
+/// request goes upstream again and gets the symbol.
 #[tokio::test]
-async fn upstream_403_is_converted_to_404_and_cors_headers_set() {
-    let (server, _upstream) = start_proxy(
-        |_| async { respond_with(403, &[("content-type", "text/plain")], "forbidden") },
+async fn upstream_403_is_an_uncached_502_not_a_miss() {
+    let (server, upstream) = start_proxy(
+        |_| async {
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                respond_with(403, &[("content-type", "text/plain")], "forbidden")
+            } else {
+                respond(200, "SYMBOL-DATA")
+            }
+        },
         None,
         &[],
     )
     .await;
 
-    let res = request(server.port, "/missing/foo.pdb/ABC/foo.pdb", &[]).await;
-    assert_eq!(res.status, 404, "expected 403 to be rewritten to 404");
-    assert_eq!(res.header("access-control-allow-origin"), Some("*"));
-    assert_eq!(res.header("access-control-allow-methods"), Some("GET"));
-}
-
-/// 'subsequent requests for known-missing symbols are served from cache as 404'
-#[tokio::test]
-async fn subsequent_requests_for_known_missing_symbols_are_served_from_cache_as_404() {
-    let (server, upstream) = start_proxy(|_| async { respond(403, "") }, None, &[]).await;
-
-    let first = request(server.port, "/some/Path/abc/file.pdb", &[]).await;
-    assert_eq!(first.status, 404);
+    let first = request(server.port, "/Foo/Bar.PDB/ABC/foo.pdb", &[]).await;
+    assert_eq!(first.status, 502);
+    assert_eq!(first.header("cache-control"), Some("no-store"));
+    assert_eq!(first.header("access-control-allow-origin"), Some("*"));
+    assert_eq!(first.header("access-control-allow-methods"), Some("GET"));
+    assert_error_body(&first.body);
     assert_eq!(upstream.request_count(), 1);
 
-    let second = request(server.port, "/some/Path/abc/file.pdb", &[]).await;
-    assert_eq!(second.status, 404);
+    let second = request(server.port, "/Foo/Bar.PDB/ABC/foo.pdb", &[]).await;
     assert_eq!(
-        upstream.request_count(),
-        1,
-        "cached miss should NOT contact upstream again"
+        second.status, 200,
+        "an upstream 403 must not be negative-cached"
     );
-
-    let third = request(server.port, "/some/Other/abc/file.pdb", &[]).await;
-    assert_eq!(third.status, 404);
+    assert_eq!(second.body, "SYMBOL-DATA");
     assert_eq!(upstream.request_count(), 2);
+
+    let stderr = server.stderr();
+    assert!(
+        stderr.contains("upstream refused GET /foo/bar.pdb/abc/foo.pdb with 403"),
+        "{stderr}"
+    );
+}
+
+/// New: the client's credentials and Azure storage headers never reach the
+/// store (a stray Authorization makes the blob endpoint answer 403
+/// AuthenticationFailed), while ordinary request headers still do.
+#[tokio::test]
+async fn client_credentials_and_x_ms_headers_are_not_forwarded_upstream() {
+    let (server, upstream) = start_proxy(ok_handler, None, &[]).await;
+
+    let res = request(
+        server.port,
+        "/foo/bar.pdb/abc/foo.pdb",
+        &[
+            ("authorization", "Bearer client-token"),
+            ("proxy-authorization", "Basic Zm9vOmJhcg=="),
+            ("cookie", "session=abc"),
+            ("x-ms-version", "2025-01-05"),
+            ("X-MS-Client-Request-Id", "abc"),
+            ("user-agent", "Microsoft-Symbol-Server/10.0"),
+            ("range", "bytes=0-1"),
+            ("if-none-match", "\"etag\""),
+        ],
+    )
+    .await;
+    assert_eq!(res.status, 200);
+
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    let headers = &requests[0].headers;
+    for name in [
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "x-ms-version",
+        "x-ms-client-request-id",
+    ] {
+        assert!(!headers.contains_key(name), "{name} was forwarded upstream");
+    }
+    assert_eq!(headers["user-agent"], "Microsoft-Symbol-Server/10.0");
+    assert_eq!(headers["range"], "bytes=0-1");
+    assert_eq!(headers["if-none-match"], "\"etag\"");
 }
 
 /// 'upstream non-403 errors are passed through and not cached as missing'
@@ -270,8 +385,8 @@ async fn upstream_non_403_errors_are_passed_through_and_not_cached_as_missing() 
     assert_eq!(upstream.request_count(), 2);
 }
 
-/// New: pins current behavior. Only upstream 403s are negative-cached; an
-/// upstream 404 is passed through untouched (no Cache-Control added) and the
+/// New: pins current behavior. An upstream 404 (the store's miss) is passed
+/// through untouched (no Cache-Control added) and the
 /// next request goes upstream again.
 #[tokio::test]
 async fn upstream_404_is_passed_through_and_not_negative_cached() {
@@ -391,7 +506,7 @@ async fn head_is_forwarded_upstream() {
 }
 
 /// New: a refusal from the egress proxy (marked `x-egress-proxy: deny`) is
-/// not the CDN's "no such object" 403. It becomes an uncacheable 502 with an
+/// not the store's answer. It becomes an uncacheable 502 with an
 /// error ID, is logged, and is not negative-cached, so the symbol is fetched
 /// again once the allowlist is fixed.
 #[tokio::test]
@@ -441,10 +556,11 @@ async fn egress_proxy_denials_are_uncached_502s_not_misses() {
     );
 }
 
-/// New: only the proxy's exact marker counts; a CDN 403 carrying some other
-/// x-egress-proxy value is still a miss.
+/// New: only the proxy's exact marker counts as the proxy's refusal; a
+/// store 403 carrying some other x-egress-proxy value is logged as the
+/// store's refusal (still an uncached 502, never a miss).
 #[tokio::test]
-async fn upstream_403_without_the_deny_marker_is_still_a_miss() {
+async fn upstream_403_without_the_deny_marker_is_the_stores_refusal() {
     let (server, upstream) = start_proxy(
         |_| async { respond_with(403, &[("x-egress-proxy", "allow")], "") },
         None,
@@ -452,28 +568,18 @@ async fn upstream_403_without_the_deny_marker_is_still_a_miss() {
     )
     .await;
 
-    let res = request(server.port, "/missing/foo.pdb/abc/foo.pdb", &[]).await;
-    assert_eq!(res.status, 404);
-    assert_eq!(res.header("cache-control"), Some(MISSING_CACHE_CONTROL));
-    let res = request(server.port, "/missing/foo.pdb/abc/foo.pdb", &[]).await;
-    assert_eq!(res.status, 404);
-    assert_eq!(upstream.request_count(), 1);
-}
-
-/// 'negative-cache 404s carry a public Cache-Control header'
-#[tokio::test]
-async fn negative_cache_404s_carry_a_public_cache_control_header() {
-    let (server, upstream) = start_proxy(|_| async { respond(403, "") }, None, &[]).await;
-
-    let first = request(server.port, "/missing/foo.pdb/abc/foo.pdb", &[]).await;
-    assert_eq!(first.status, 404);
-    assert_eq!(first.header("cache-control"), Some(MISSING_CACHE_CONTROL));
-
-    // Served from the negative cache without contacting upstream.
-    let second = request(server.port, "/missing/foo.pdb/abc/foo.pdb", &[]).await;
-    assert_eq!(second.status, 404);
-    assert_eq!(second.header("cache-control"), Some(MISSING_CACHE_CONTROL));
-    assert_eq!(upstream.request_count(), 1);
+    for i in 1..=2 {
+        let res = request(server.port, "/missing/foo.pdb/abc/foo.pdb", &[]).await;
+        assert_eq!(res.status, 502);
+        assert_eq!(res.header("cache-control"), Some("no-store"));
+        assert_eq!(upstream.request_count(), i);
+    }
+    let stderr = server.stderr();
+    assert!(
+        stderr.contains("upstream refused GET /missing/foo.pdb/abc/foo.pdb with 403"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("egress proxy refused"), "{stderr}");
 }
 
 /// 'successful 200s get a long immutable Cache-Control when upstream sends none'
@@ -702,7 +808,7 @@ async fn asserts_when_target_host_is_missing() {
 #[tokio::test]
 async fn upstream_connections_are_reused_across_misses() {
     const N: usize = 20;
-    let (server, upstream) = start_proxy(|_| async { respond(403, "") }, None, &[]).await;
+    let (server, upstream) = start_proxy(|_| async { respond(404, "") }, None, &[]).await;
 
     for i in 0..N {
         let res = request(server.port, &format!("/reuse/{i}/abc/file.pdb"), &[]).await;
@@ -722,7 +828,7 @@ async fn upstream_connections_are_reused_across_misses() {
 async fn upstream_pool_max_idle_0_opens_a_connection_per_miss() {
     const N: usize = 5;
     let (server, upstream) = start_proxy(
-        |_| async { respond(403, "") },
+        |_| async { respond(404, "") },
         None,
         &[("UPSTREAM_POOL_MAX_IDLE", "0")],
     )
@@ -891,10 +997,10 @@ async fn non_2xx_responses_pass_through_while_max_inflight_upstream_is_saturated
         assert_eq!(res.status, 404);
         assert_eq!(res.body, "not found");
     }
-    // An upstream 403 is still turned into a negative-cached 404.
+    // An upstream 403 is an uncached 502, also without taking a slot.
     let res = request(server.port, "/forbidden/0/abc/file.pdb", &[]).await;
-    assert_eq!(res.status, 404);
-    assert_eq!(res.header("cache-control"), Some(MISSING_CACHE_CONTROL));
+    assert_eq!(res.status, 502);
+    assert_eq!(res.header("cache-control"), Some("no-store"));
     assert_eq!(upstream.request_count(), 8);
     drop(held);
 }
